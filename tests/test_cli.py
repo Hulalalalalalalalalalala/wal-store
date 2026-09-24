@@ -10,6 +10,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
 from wal_store.cli import main
+from wal_store.store import _encode_frame, _OP_PUT
 
 
 class CliBase(unittest.TestCase):
@@ -38,12 +39,16 @@ class CliBase(unittest.TestCase):
         wrapper.detach()
         return code, raw.getvalue(), err.getvalue()
 
+    def write_value_file(self, payload=b"v"):
+        vf = os.path.join(self.dir, "v.bin")
+        with open(vf, "wb") as f:
+            f.write(payload)
+        return vf
+
 
 class CliTest(CliBase):
     def test_put_get_recover(self):
-        vf = os.path.join(self.dir, "v.bin")
-        with open(vf, "wb") as f:
-            f.write(b"hello")
+        vf = self.write_value_file(b"hello")
         code, _, err = self.run_cli("--path", self.dir, "put",
                                     "k", "--value-file", vf)
         self.assertEqual(code, 0, err)
@@ -54,13 +59,11 @@ class CliTest(CliBase):
 
         code, out, err = self.run_cli("--path", self.dir, "recover")
         self.assertEqual(code, 0, err)
-        self.assertEqual(out, "1 1\n")
+        self.assertEqual(out, '{"applied":1,"discarded":0,"seq":1}\n')
 
     def test_get_writes_raw_bytes_to_binary_stdout(self):
         payload = bytes(range(256))
-        vf = os.path.join(self.dir, "v.bin")
-        with open(vf, "wb") as f:
-            f.write(payload)
+        vf = self.write_value_file(payload)
         self.run_cli("--path", self.dir, "put", "k",
                      "--value-file", vf)
 
@@ -99,9 +102,7 @@ class CliTest(CliBase):
         self.assertEqual(out, "")
 
         # Empty key -> ValueError from the storage layer.
-        vf = os.path.join(self.dir, "v.bin")
-        with open(vf, "wb") as f:
-            f.write(b"v")
+        vf = self.write_value_file()
         code, _, err = self.run_cli("--path", self.dir, "put", "",
                                     "--value-file", vf)
         self.assertEqual(code, 3)
@@ -110,7 +111,48 @@ class CliTest(CliBase):
     def test_recover_on_fresh_store(self):
         code, out, err = self.run_cli("--path", self.dir, "recover")
         self.assertEqual(code, 0, err)
-        self.assertEqual(out, "0 0\n")
+        self.assertEqual(out, '{"applied":0,"discarded":0,"seq":0}\n')
+
+    def test_recover_missing_directory_exit_3(self):
+        missing = os.path.join(self.dir, "no-such-store")
+        code, out, err = self.run_cli("--path", missing, "recover")
+        self.assertEqual(code, 3)
+        self.assertEqual(out, "")
+        self.assertIn("error", err)
+        self.assertFalse(os.path.exists(missing))
+
+    def test_recover_reports_discarded_tail(self):
+        vf = self.write_value_file()
+        code, _, err = self.run_cli("--path", self.dir, "put",
+                                    "a", "--value-file", vf)
+        self.assertEqual(code, 0, err)
+        # A complete uncommitted record plus a torn partial one.
+        frame = _encode_frame(_OP_PUT, b"x", key="b")
+        with open(os.path.join(self.dir, "wal.log"), "ab") as f:
+            f.write(frame + frame[:7])
+        code, out, err = self.run_cli("--path", self.dir, "recover")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out, '{"applied":1,"discarded":2,"seq":1}\n')
+        # Recovering the now-clean store reports nothing discarded.
+        code, out, err = self.run_cli("--path", self.dir, "recover")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out, '{"applied":1,"discarded":0,"seq":1}\n')
+
+    def test_recover_corrupt_exit_3_no_json(self):
+        vf = self.write_value_file()
+        code, _, err = self.run_cli("--path", self.dir, "put",
+                                    "a", "--value-file", vf)
+        self.assertEqual(code, 0, err)
+        log = os.path.join(self.dir, "wal.log")
+        with open(log, "r+b") as f:
+            damaged = bytearray(f.read())
+            damaged[-1] ^= 0xFF  # break the CRC of the commit frame
+            f.seek(0)
+            f.write(damaged)
+        code, out, err = self.run_cli("--path", self.dir, "recover")
+        self.assertEqual(code, 3)
+        self.assertEqual(out, "")  # no JSON line on stdout
+        self.assertEqual(len(err.strip().splitlines()), 1)
 
 
 class CliSubprocessTest(CliBase):
@@ -122,9 +164,7 @@ class CliSubprocessTest(CliBase):
             capture_output=True)
 
     def test_module_get_hit_and_miss(self):
-        vf = os.path.join(self.dir, "v.bin")
-        with open(vf, "wb") as f:
-            f.write(b"line1\nline2\nno trailing newline")
+        vf = self.write_value_file(b"line1\nline2\nno trailing newline")
         r = self.module("put", "k", "--value-file", vf)
         self.assertEqual(r.returncode, 0, r.stderr)
 
@@ -137,14 +177,35 @@ class CliSubprocessTest(CliBase):
         self.assertEqual(r.stdout, b"")
 
     def test_module_recover_format(self):
-        vf = os.path.join(self.dir, "v.bin")
-        with open(vf, "wb") as f:
-            f.write(b"v")
+        vf = self.write_value_file()
         self.module("put", "a", "--value-file", vf)
         self.module("put", "b", "--value-file", vf)
         r = self.module("recover")
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(r.stdout, b"2 2\n")
+        self.assertEqual(r.stdout, b'{"applied":2,"discarded":0,"seq":2}\n')
+
+    def test_module_recover_corrupt_exit_3(self):
+        vf = self.write_value_file()
+        r = self.module("put", "a", "--value-file", vf)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        log = os.path.join(self.dir, "wal.log")
+        with open(log, "r+b") as f:
+            damaged = bytearray(f.read())
+            damaged[-1] ^= 0xFF
+            f.seek(0)
+            f.write(damaged)
+        r = self.module("recover")
+        self.assertEqual(r.returncode, 3)
+        self.assertEqual(r.stdout, b"")
+        self.assertNotEqual(r.stderr, b"")
+
+    def test_module_recover_missing_directory(self):
+        missing = os.path.join(self.dir, "gone")
+        r = subprocess.run(
+            [sys.executable, "-m", "wal_store", "--path", missing, "recover"],
+            capture_output=True)
+        self.assertEqual(r.returncode, 3)
+        self.assertEqual(r.stdout, b"")
 
     def test_module_usage_error_on_stderr(self):
         r = subprocess.run(

@@ -12,6 +12,7 @@ Exit codes: 0 success, 1 missing key on get, 2 usage error, 3 storage error.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from typing import Sequence
 
@@ -23,7 +24,7 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="wal_store",
         description="Write-ahead log key value store.")
     parser.add_argument("--path", required=True,
-                        help="store directory (created if missing)")
+                        help="store directory (must already exist)")
 
     commands = parser.add_subparsers(dest="command", required=True)
 
@@ -64,7 +65,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "recover":
             with Store(args.path) as store:
                 result = store.recover()
-            sys.stdout.write(f"{result['applied']} {result['seq']}\n")
+            sys.stdout.write(json.dumps(result, separators=(",", ":")) + "\n")
             return 0
     except (ValueError, TypeError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)

@@ -18,13 +18,15 @@ Python 3.11 or newer. Standard library only.
 
 ## Public interface
 
-`wal_store.Store(path)` opens the store directory.
+`wal_store.Store(path)` opens the store directory; a missing directory raises `FileNotFoundError`.
 - `put(key, value) -> None` records a mutation.
 - `get(key) -> bytes | None` reads the current value.
 - `delete(key) -> None` records a removal.
 - `commit() -> int` advances the durable sequence number.
-- `recover() -> dict` replays the log and reports what it applied.
+- `recover() -> dict` replays the log and reports `{"applied": int, "discarded": int, "seq": int}`: committed mutations applied, uncommitted tail records discarded, and the durable sequence number.
 - `stats() -> dict` reports sequence, entries and bytes.
+
+A record torn by a kill mid-write is simply discarded at recovery; damage anywhere else in the log raises `wal_store.CorruptLogError` (a `ValueError`). `python3 -m wal_store --path DIR recover` prints the report as one compact JSON line and exits 3 without printing it when the log is corrupt.
 
 ## Tests
 

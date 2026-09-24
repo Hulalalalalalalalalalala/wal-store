@@ -3,7 +3,10 @@
 Every mutation is first appended to a framed log. A commit marker is the
 only thing that advances the durable sequence number. When a store is opened,
 any tail that was never committed (including a record torn by a hard kill) is
-discarded, so recovery always yields exactly the committed state.
+discarded, so recovery always yields exactly the committed state. Only the
+very end of the log may be incomplete; a damaged frame anywhere else, an
+out-of-bounds length, unparseable content, or a duplicated or regressed
+commit sequence is corruption and makes recovery raise CorruptLogError.
 
 Log frame layout (all integers big-endian)::
 
@@ -23,7 +26,7 @@ import json
 import os
 import zlib
 
-__all__ = ["Store"]
+__all__ = ["Store", "CorruptLogError"]
 
 LOG_NAME = "wal.log"
 
@@ -35,6 +38,16 @@ _MAX_PAYLOAD = 1 << 40
 _OP_PUT = "p"
 _OP_DELETE = "d"
 _OP_COMMIT = "c"
+
+
+class CorruptLogError(ValueError):
+    """The log is damaged beyond a torn, uncommitted final record.
+
+    Raised when a frame in the middle of the log is incomplete, a length
+    is out of bounds, frame content cannot be parsed, or a commit sequence
+    number is duplicated or goes backwards. Recovery stops; nothing is
+    replayed or truncated.
+    """
 
 
 def _encode_frame(op: str, value: bytes = b"", key: str | None = None,
@@ -116,8 +129,9 @@ def _write_all(fd: int, data: bytes) -> None:
 class Store:
     """A single-writer key value store backed by an append-only log.
 
-    ``path`` is the store directory; it is created when missing. Opening a
-    path that points at a regular file raises ``OSError``.
+    ``path`` is the store directory and must already exist; a missing
+    directory raises ``FileNotFoundError`` before any log replay. Opening
+    a path that points at a regular file raises ``OSError``.
     """
 
     def __init__(self, path: str):
@@ -126,16 +140,15 @@ class Store:
 
         if os.path.lexists(path) and not os.path.isdir(path):
             raise OSError(f"store path is not a directory: {path!r}")
-        dir_created = not os.path.isdir(path)
-        if dir_created:
-            os.makedirs(path, exist_ok=True)
+        if not os.path.isdir(path):
+            raise FileNotFoundError(
+                f"store directory does not exist: {path!r}")
 
         log_created = not os.path.exists(self._path)
         self._fd = os.open(self._path, os.O_WRONLY | os.O_CREAT | os.O_APPEND,
                            0o644)
         if log_created:
             os.fsync(self._fd)
-        if dir_created or log_created:
             _fsync_dir(path)
 
         self._data: dict[str, bytes] = {}
@@ -144,6 +157,8 @@ class Store:
         self._pending = 0
         self._closed = False
         self._corrupt = False
+        self._corrupt_error: CorruptLogError | None = None
+        self._report: dict | None = None
 
         self._load_on_open()
 
@@ -165,10 +180,11 @@ class Store:
     def _validate(frames, terminal):
         """Validate every frame and commit ordering.
 
-        Returns ``(committed_end, last_seq)`` -- the byte offset just past
-        the last commit marker and its sequence number. Raises ValueError on
-        unknown frames, bad metadata, or any gap/duplicate in the strictly
-        increasing commit sequence.
+        Returns ``(committed_end, last_seq, discarded)`` -- the byte offset
+        just past the last commit marker, its sequence number, and how many
+        tail records recovery drops (uncommitted frames plus a torn final
+        record). Raises CorruptLogError on unknown frames, bad metadata, or
+        any gap/duplicate in the strictly increasing commit sequence.
         """
         expected_seq = 1
         last_seq = 0
@@ -178,23 +194,28 @@ class Store:
             if op in (_OP_PUT, _OP_DELETE):
                 key = meta.get("k")
                 if not isinstance(key, str) or key == "":
-                    raise ValueError(f"invalid frame metadata: {meta!r}")
+                    raise CorruptLogError(f"invalid frame metadata: {meta!r}")
             elif op == _OP_COMMIT:
                 seq = meta.get("s")
                 if not isinstance(seq, int) or isinstance(seq, bool):
-                    raise ValueError(f"invalid commit marker: {meta!r}")
+                    raise CorruptLogError(f"invalid commit marker: {meta!r}")
                 if seq != expected_seq:
-                    raise ValueError(
+                    raise CorruptLogError(
                         f"commit sequence {seq} out of order, "
                         f"expected {expected_seq}")
                 last_seq = seq
                 expected_seq += 1
                 committed_end = end
             else:
-                raise ValueError(f"unknown frame type: {op!r}")
+                raise CorruptLogError(f"unknown frame type: {op!r}")
         if terminal is not None and terminal[0] == "invalid":
-            raise ValueError("corrupt log frame")
-        return committed_end, last_seq
+            raise CorruptLogError("corrupt log frame")
+        discarded = sum(1 for _m, _v, start, _e in frames
+                        if start >= committed_end)
+        if terminal is not None and terminal[0] == "torn":
+            # The final record was only half written when the process died.
+            discarded += 1
+        return committed_end, last_seq, discarded
 
     @staticmethod
     def _replay(frames, committed_end) -> tuple[dict[str, bytes], int]:
@@ -213,23 +234,20 @@ class Store:
             applied += 1
         return state, applied
 
-    def _load_on_open(self) -> None:
-        """Crash cleanup: replay the committed prefix, drop the dirty tail.
+    def _recover_locked(self) -> dict:
+        """Scan the log, replay the committed prefix, drop the dirty tail.
 
-        When the log proves fully valid, everything past the last commit
-        marker (plus a possible torn final frame) is truncated away. If the
-        log is corrupt nothing is touched and the store stays empty until a
-        ``recover`` call explains the problem.
+        Everything past the last commit marker (plus a possible torn final
+        frame) is truncated away. Returns the recovery report. Raises
+        CorruptLogError without touching any state when the log is damaged.
         """
         frames, terminal = self._read_log()
-        try:
-            committed_end, last_seq = self._validate(frames, terminal)
-        except ValueError:
-            # Keep the corrupt log untouched; recover() will report it.
-            self._corrupt = True
-            return
 
-        state, _applied = self._replay(frames, committed_end)
+        # Phase 1: validate the whole log before touching any state.
+        committed_end, last_seq, discarded = self._validate(frames, terminal)
+
+        # Phase 2: replay into a fresh mapping, then publish it.
+        state, applied = self._replay(frames, committed_end)
 
         size = os.fstat(self._fd).st_size
         if size > committed_end:
@@ -238,8 +256,24 @@ class Store:
 
         self._data = state
         self._seq = last_seq
+        self._pending = 0
         self._entries = sum(1 for _m, _v, _s, end in frames
                             if end <= committed_end)
+        return {"applied": applied, "discarded": discarded, "seq": last_seq}
+
+    def _load_on_open(self) -> None:
+        """Crash cleanup: replay the committed prefix, drop the dirty tail.
+
+        When the log proves fully valid the recovery report is remembered
+        for recover(). If the log is corrupt nothing is touched and the
+        store stays empty until a ``recover`` call explains the problem.
+        """
+        try:
+            self._report = self._recover_locked()
+        except CorruptLogError as exc:
+            # Keep the corrupt log untouched; recover() will report it.
+            self._corrupt = True
+            self._corrupt_error = exc
 
     # -- argument validation ----------------------------------------------
 
@@ -294,34 +328,28 @@ class Store:
         self._seq += 1
         self._pending = 0
         self._entries += 1
+        self._report = None
         return self._seq
 
     def recover(self) -> dict:
+        """Replay the log and report what recovery did.
+
+        Returns a dict with three integer keys, in this order: ``applied``
+        (committed mutations replayed), ``discarded`` (uncommitted tail
+        records dropped, including a torn final record) and ``seq`` (the
+        durable sequence number after recovery). A log damaged beyond a
+        torn tail raises CorruptLogError and nothing is replayed.
+        """
         self._ensure_open()
         if self._pending:
             raise ValueError(
                 "cannot recover with uncommitted changes in this session")
-
-        frames, terminal = self._read_log()
-
-        # Phase 1: validate the whole log before touching any state.
-        committed_end, last_seq = self._validate(frames, terminal)
-
-        # Phase 2: replay into a fresh mapping, then publish it.
-        state, applied = self._replay(frames, committed_end)
-
-        size = os.fstat(self._fd).st_size
-        if size > committed_end:
-            os.ftruncate(self._fd, committed_end)
-            os.fsync(self._fd)
-
-        self._data = state
-        self._seq = last_seq
-        self._pending = 0
-        self._entries = sum(1 for _m, _v, _s, end in frames
-                            if end <= committed_end)
-        self._corrupt = False
-        return {"applied": applied, "seq": last_seq}
+        if self._corrupt:
+            raise self._corrupt_error
+        if self._report is None:
+            # Commits since the open-time scan changed the log; rescan.
+            self._report = self._recover_locked()
+        return dict(self._report)
 
     def stats(self) -> dict:
         self._ensure_open()
