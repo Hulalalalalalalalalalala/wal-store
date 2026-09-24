@@ -21,6 +21,22 @@ from typing import Sequence
 from .store import Store
 
 
+def _write_stdout(data: bytes) -> None:
+    """Write raw bytes to stdout without any newline translation.
+
+    Always goes through the binary buffer so a trailing LF cannot be
+    expanded to CRLF on Windows. A stdout without a binary buffer (test
+    doubles, exotic embeddings) gets the same bytes decoded instead.
+    """
+    buffer = getattr(sys.stdout, "buffer", None)
+    if buffer is not None:
+        buffer.write(data)
+        buffer.flush()
+    else:  # pragma: no cover - text-only stdout environments
+        sys.stdout.write(data.decode("utf-8"))
+        sys.stdout.flush()
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="wal_store",
@@ -54,8 +70,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 value = store.get(args.key)
             if value is None:
                 return 1
-            sys.stdout.buffer.write(value)
-            sys.stdout.buffer.flush()
+            _write_stdout(value)
             return 0
 
         if args.command == "put":
@@ -72,9 +87,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "recover":
             with Store(args.path) as store:
                 result = store.recover()
-            # Key order follows the report: applied, discarded, seq.
-            line = json.dumps(result, separators=(",", ":"))
-            sys.stdout.write(line + "\n")
+            # Key order follows the report: applied, discarded, seq. Written
+            # as raw bytes so the trailing LF is not expanded on Windows.
+            line = (json.dumps(result, separators=(",", ":")) + "\n")
+            _write_stdout(line.encode("utf-8"))
             return 0
     except (ValueError, TypeError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)

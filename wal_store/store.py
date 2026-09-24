@@ -39,12 +39,30 @@ available at that instant -- the validated ``wal.log`` prefix or ``wal.ckp``
 -- scans it once into memory and serves every ``get`` from that index.
 Because the chosen image is complete and is only ever replaced atomically
 (never edited in place), a refresh caught mid-rename, a half-written commit,
-a torn record, or a log being rebuilt or shrunk can never expose partial
-bytes: each read lands on one full committed snapshot that was current at or
-after the open. A directory written by an older version is opened the same
-way from its log and checkpoint. Reads never replay the log afterwards, so
-their cost is independent of history and they never block the writer; a
-reader that is killed or simply hangs changes nothing on disk.
+a torn record, or a log being rebuilt, shrunk or compacted can never expose
+partial bytes: each read lands on one full committed snapshot that was
+current at or after the open. A directory written by an older version is
+opened the same way from its log and checkpoint. Reads never replay the log
+afterwards, so their cost is independent of history and they never block
+the writer; a reader that is killed or simply hangs changes nothing on disk.
+
+Compaction (``Store.compact()``) rewrites the committed history into one
+tight image without losing a byte of committed state. The compacted log
+holds exactly the live puts -- one per currently committed key, in sorted
+key order -- followed by a *base commit* marker carrying the pre-compaction
+sequence number. The durable sequence keeps that value, so the next commit
+is ``seq + 1`` and every later commit continues the strict sequence; keys
+that were deleted never come back. The image is assembled in memory and
+staged as the atomically replaced ``wal.cmp`` sidecar; finishing installs
+it as ``wal.ckp`` first and as ``wal.log`` second. Every intermediate state
+is therefore either the pair of old files or the pair of complete new
+images, which is precisely the two-image world the reader already chooses
+between: a kill anywhere leaves a state reopening converges by simply
+repeating the finish, and interrupting compaction any number of times
+produces the same bytes as one clean run. Live readers keep serving their
+pinned old snapshots (the inode survives on Unix; on Windows readers hold
+no writer-side fd) and new readers land on the new snapshot, never a mix,
+a half-written file or a byte that was already reclaimed.
 
 The durable commit boundary is the highest of the validated log boundary,
 the checkpoint boundary and the marker boundary, so it can never move
@@ -65,12 +83,16 @@ so an incomplete record in the middle of the log reads as corruption while
 a genuinely short final header reads as a torn tail.
 
 Metadata is a compact JSON object: ``{"t":"p","k":key}`` for puts,
-``{"t":"d","k":key}`` for deletes and ``{"t":"c","s":seq}`` for commits.
+``{"t":"d","k":key}`` for deletes, ``{"t":"c","s":seq}`` for ordinary
+commits and ``{"t":"b","s":seq}`` for the base commit that closes a
+compacted log. The two carry the sequence identically; a base marker is
+additionally required to be the first commit marker in its file.
 The raw value bytes follow the first newline, so values need no encoding.
 """
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import sys
@@ -92,6 +114,7 @@ class CorruptLogError(ValueError):
 LOG_NAME = "wal.log"
 _CHECKPOINT_NAME = "wal.ckp"
 _MARKER_NAME = "wal.rec"
+_COMPACT_NAME = "wal.cmp"
 
 _MAGIC = b"WAL2"
 _PREFIX = 12  # 4 bytes magic + 8 bytes payload length
@@ -102,6 +125,8 @@ _MAX_PAYLOAD = 1 << 40
 _OP_PUT = "p"
 _OP_DELETE = "d"
 _OP_COMMIT = "c"
+_OP_BASE = "b"
+_COMMIT_OPS = (_OP_COMMIT, _OP_BASE)
 
 
 def _encode_frame(op: str, value: bytes = b"", key: str | None = None,
@@ -187,11 +212,18 @@ def _fsync_dir(path: str) -> None:
     Windows cannot open directories for fsync and raises ``PermissionError``
     (access denied); directory entries there are made durable by the file's
     own flush-on-rename, so skipping the directory fsync keeps store creation
-    working everywhere.
+    working everywhere. Other platforms occasionally refuse the directory
+    open or the fsync the same way (restrictive mounts, virtualised FSes);
+    that is likewise best-effort -- the file's own fsync is what carries the
+    data -- so a ``PermissionError`` at either step never aborts store
+    creation or a commit/compaction.
     """
     if sys.platform == "win32":
         return
-    fd = os.open(path, os.O_RDONLY)
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except PermissionError:
+        return
     try:
         try:
             os.fsync(fd)
@@ -266,8 +298,9 @@ class Store:
     snapshot is independent of the log's later history, so a read never
     replays the log and cannot block the writer, and uncommitted bytes, a
     half-written commit, a torn record or a half-finished rebuild are never
-    visible. ``put``, ``delete``, ``commit`` and ``recover`` are rejected on
-    a read-only store; ``stats`` reports the pinned snapshot.
+    visible. ``put``, ``delete``, ``commit``, ``recover`` and ``compact``
+    are rejected on a read-only store; ``stats`` reports the pinned
+    snapshot.
     """
 
     def __init__(self, path: str, read_only: bool = False):
@@ -275,6 +308,7 @@ class Store:
         self._path = os.path.join(path, LOG_NAME)
         self._ckp_path = os.path.join(path, _CHECKPOINT_NAME)
         self._marker_path = os.path.join(path, _MARKER_NAME)
+        self._cmp_path = os.path.join(path, _COMPACT_NAME)
         self._read_only = read_only
 
         # Recovery needs a directory to replay; a missing target is an error
@@ -334,6 +368,12 @@ class Store:
         terminal is corruption and raises ``CorruptLogError``; a ``"torn"``
         terminal is left for the caller, which decides from the durable
         checkpoint whether it is a tail to discard or a gash to restore.
+
+        A compacted image starts with a base commit marker (``"b"``) that
+        carries the pre-compaction sequence: it must be the first commit
+        marker in the file, it establishes the expected sequence at
+        ``seq + 1`` and no second base marker may ever follow. An ordinary
+        first commit must still be sequence 1.
         """
         expected_seq = 1
         last_seq = 0
@@ -345,6 +385,20 @@ class Store:
                 if not isinstance(key, str) or key == "":
                     raise CorruptLogError(
                         f"invalid frame metadata: {meta!r}")
+            elif op == _OP_BASE:
+                seq = meta.get("s")
+                if not isinstance(seq, int) or isinstance(seq, bool):
+                    raise CorruptLogError(
+                        f"invalid base commit marker: {meta!r}")
+                if last_seq != 0:
+                    raise CorruptLogError(
+                        "base commit must be the first commit marker")
+                if seq < 1:
+                    raise CorruptLogError(
+                        f"base commit sequence {seq} out of order")
+                last_seq = seq
+                expected_seq = seq + 1
+                committed_end = end
             elif op == _OP_COMMIT:
                 seq = meta.get("s")
                 if not isinstance(seq, int) or isinstance(seq, bool):
@@ -369,7 +423,7 @@ class Store:
         applied = 0
         for meta, value, _start, _end in frames:
             op = meta["t"]
-            if op == _OP_COMMIT:
+            if op in _COMMIT_OPS:
                 continue
             if op == _OP_PUT:
                 state[meta["k"]] = value
@@ -377,6 +431,13 @@ class Store:
                 state.pop(meta["k"], None)
             applied += 1
         return state, applied
+
+    @staticmethod
+    def _last_seq(frames) -> int:
+        return max(
+            (meta["s"] for meta, _v, _s, _e in frames
+             if meta.get("t") in _COMMIT_OPS),
+            default=0)
 
     # -- crash-convergence sidecars ---------------------------------------
 
@@ -471,7 +532,7 @@ class Store:
 
     def _remove_stale_temps(self) -> None:
         for name in (self._path + ".tmp", self._ckp_path + ".tmp",
-                     self._marker_path + ".tmp"):
+                     self._marker_path + ".tmp", self._cmp_path + ".tmp"):
             try:
                 os.unlink(name)
             except FileNotFoundError:
@@ -531,6 +592,186 @@ class Store:
         if os.fstat(self._fd).st_size != clean_end:
             raise CorruptLogError("restore did not converge")
 
+    # -- compaction --------------------------------------------------------
+
+    def _build_compact_image(self, seq: int) -> tuple[bytes, int]:
+        """Serialise the committed state into one compact log image.
+
+        One put frame per live key, keys in sorted order, followed by a base
+        commit marker carrying the pre-compaction sequence. The empty state
+        at seq 0 is an empty image rather than a zero-sequence marker.
+        """
+        if seq == 0:
+            return b"", 0
+        parts = [_encode_frame(_OP_PUT, value, key=key)
+                 for key, value in sorted(self._data.items())]
+        parts.append(_encode_frame(_OP_BASE, seq=seq))
+        return b"".join(parts), len(self._data)
+
+    def _read_compact_candidate(self):
+        """Validate ``wal.cmp`` as one compacted image.
+
+        Returns ``(image, end, seq, live)`` where ``image`` is the exact
+        byte content, or ``None`` when the sidecar is absent. The image must
+        be a clean file ending exactly on a base commit marker, preceded only
+        by put frames with strictly increasing keys; anything else is
+        corruption of the crash-convergence machinery, never a discardable
+        tail (the sidecar is always atomically replaced, never written in
+        place).
+        """
+        try:
+            f = open(self._cmp_path, "rb")
+        except FileNotFoundError:
+            return None
+        with f:
+            image = f.read()
+        if not image:
+            # An empty candidate encodes the empty state at seq 0.
+            return b"", 0, 0, 0
+
+        frames, terminal = self._scan_bytes(image)
+        if terminal is not None:
+            raise CorruptLogError(
+                "compaction candidate is not a clean committed prefix")
+        end, seq = self._validate(frames, None)
+        if end != len(image) or seq <= 0:
+            raise CorruptLogError(
+                "compaction candidate has bytes past its base commit")
+        live = 0
+        last_key: str | None = None
+        saw_base = False
+        for meta, _value, _start, _end in frames:
+            op = meta.get("t")
+            if op == _OP_PUT:
+                if saw_base:
+                    raise CorruptLogError(
+                        "compaction candidate has puts past its base commit")
+                key = meta["k"]
+                if last_key is not None and key <= last_key:
+                    raise CorruptLogError(
+                        "compaction candidate keys are not sorted uniquely")
+                last_key = key
+                live += 1
+            elif op == _OP_BASE:
+                if saw_base:
+                    raise CorruptLogError(
+                        "compaction candidate has multiple base commits")
+                saw_base = True
+            else:
+                raise CorruptLogError(
+                    "compaction candidate contains a non-compacted frame")
+        if not saw_base:
+            raise CorruptLogError(
+                "compaction candidate ends without a base commit")
+        return image, end, seq, live
+
+    def _scan_bytes(self, data: bytes):
+        """Frame-scan raw bytes as if they were a log file."""
+        frames = []
+        terminal = None
+        with io.BytesIO(data) as f:
+            for event in _iter_frames(f):
+                if event[0] == "frame":
+                    _, meta, value, start, end = event
+                    frames.append((meta, value, start, end))
+                else:
+                    terminal = event
+        return frames, terminal
+
+    def _install_log_bytes(self, image: bytes) -> None:
+        """Atomically replace the log with ``image`` and reopen the fd.
+
+        The complete image is written and fsynced as a temp file first, so a
+        kill leaves either the old log or the complete new one -- never a
+        half-written log. The append fd is closed for the rename because
+        Windows cannot replace a path held open by it, then reopened.
+        """
+        tmp = self._path + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(image)
+            f.truncate(len(image))
+            os.fsync(f.fileno())
+        os.close(self._fd)
+        try:
+            os.replace(tmp, self._path)
+            _fsync_dir(self._dir)
+        finally:
+            self._fd = os.open(
+                self._path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        if os.fstat(self._fd).st_size != len(image):
+            raise CorruptLogError("compaction did not converge")
+
+    def _install_compaction(self, image: bytes, seq: int) -> None:
+        """Publish a staged compacted image; idempotent and kill-safe.
+
+        The torn-tail marker is dropped first: its byte offset belongs to
+        the old (longer) log and must not outlive the shrink. Checkpoint is
+        replaced next and the log last, both via complete-file atomic
+        renames, then the candidate is removed. Any ordering of a kill
+        between those steps leaves the durable files equal to either the old
+        pair or the complete new pair, and rerunning (via the surviving
+        candidate) converges to the same compacted bytes.
+        """
+        # Compaction closes any prior recovery epoch the way a commit does;
+        # do it while the old log still exists so a later kill replays this
+        # whole publish from the durable candidate.
+        self._remove_marker()
+
+        if seq == 0:
+            # Empty committed state: the log is zero length and there is no
+            # checkpoint to publish; reclaim every old byte and drop the plan.
+            os.ftruncate(self._fd, 0)
+            os.fsync(self._fd)
+            try:
+                os.unlink(self._ckp_path)
+                _fsync_dir(self._dir)
+            except FileNotFoundError:
+                pass
+            self._remove_candidate()
+            return
+
+        def write(fdst):
+            fdst.write(image)
+
+        self._atomic_file(self._ckp_path, write)
+        self._install_log_bytes(image)
+        self._remove_candidate()
+
+    def _remove_candidate(self) -> None:
+        try:
+            os.unlink(self._cmp_path)
+        except FileNotFoundError:
+            return
+        _fsync_dir(self._dir)
+
+    def _finish_compaction(self) -> None:
+        """Complete a compaction interrupted after its candidate went durable.
+
+        With a single writer a present candidate means its compaction never
+        finished (no later commit was possible), so the log and checkpoint
+        cannot be ahead of it; the publish is simply repeated. A candidate
+        whose boundary a newer durable epoch has overtaken is stale and is
+        discarded instead.
+        """
+        candidate = self._read_compact_candidate()
+        if candidate is None:
+            return
+        image, _end, cand_seq, _live = candidate
+
+        log_seq = 0
+        if os.path.exists(self._path):
+            frames, terminal = self._read_log(self._path)
+            _log_end, log_seq = self._validate(frames, terminal)
+        ckp_seq = 0
+        ckp = self._read_clean_prefix(self._ckp_path)
+        if ckp is not None:
+            _frames, _end, ckp_seq = ckp
+        if max(log_seq, ckp_seq) > cand_seq:
+            # A newer committed epoch exists; the staged image is obsolete.
+            self._remove_candidate()
+            return
+        self._install_compaction(image, cand_seq)
+
     def _converge(self):
         """Validate and converge the on-disk log to its clean state.
 
@@ -547,6 +788,10 @@ class Store:
         next commit even when the kill lands mid-repair.
         """
         self._remove_stale_temps()
+        # A durable compaction candidate left by a killed compact() is
+        # published before ordinary convergence; it is itself a complete
+        # committed prefix, so this never invents or loses a committed byte.
+        self._finish_compaction()
         marker = self._read_marker()
         marker_end = -1
         marker_discarded = 0
@@ -614,10 +859,7 @@ class Store:
     def _publish(self, frames, discarded) -> None:
         state, _applied = self._replay(frames)
         self._data = state
-        self._seq = max(
-            (meta["s"] for meta, _v, _s, _e in frames
-             if meta.get("t") == _OP_COMMIT),
-            default=0)
+        self._seq = self._last_seq(frames)
         self._entries = len(frames)
         self._pending = 0
         self._discarded = discarded
@@ -823,10 +1065,7 @@ class Store:
         frames, discarded = self._converge()
 
         state, applied = self._replay(frames)
-        seq = max(
-            (meta["s"] for meta, _v, _s, _e in frames
-             if meta.get("t") == _OP_COMMIT),
-            default=0)
+        seq = self._last_seq(frames)
         self._data = state
         self._seq = seq
         self._entries = len(frames)
@@ -834,6 +1073,61 @@ class Store:
         self._discarded = discarded
         self._corrupt = False
         return {"applied": applied, "discarded": discarded, "seq": seq}
+
+    def compact(self) -> dict:
+        """Rewrite committed history into one tight, kill-safe log image.
+
+        The log becomes exactly the currently committed state: one put frame
+        per live key (sorted by key) followed by a base commit marker that
+        carries the pre-compaction sequence number. Deleted keys are gone for
+        good, the durable sequence keeps its value (the next commit is
+        ``seq + 1``) and the old log/checkpoint space is reclaimed. The
+        empty committed state compacts to an empty log.
+
+        Returns the same three-field report shape as :meth:`recover` for the
+        compacted log: ``applied`` is the live puts it now contains,
+        ``discarded`` is always 0 and ``seq`` is the preserved sequence.
+
+        Uncommitted session changes are rejected (``ValueError``). The image
+        is staged as a complete sidecar and published by two atomic
+        renames, so a kill at any byte/step -- including a kill repeated any
+        number of times -- leaves a state the next open converges by simply
+        finishing the same publish, byte-identical to one clean compaction.
+        Live read-only stores keep pinning their old complete snapshots
+        throughout; compaction never waits on or is disturbed by them.
+        """
+        self._ensure_writable()
+        if self._pending:
+            raise ValueError(
+                "cannot compact with uncommitted changes in this session")
+
+        # Settle any crash remnant (including an interrupted compaction)
+        # before snapshotting the committed state.
+        frames, discarded = self._converge()
+        state, _applied = self._replay(frames)
+        seq = self._last_seq(frames)
+        self._data = state
+        self._seq = seq
+        self._entries = len(frames)
+        self._pending = 0
+        self._discarded = discarded
+        self._corrupt = False
+
+        image, live = self._build_compact_image(seq)
+        self._write_compact_candidate(image)
+        self._install_compaction(image, seq)
+
+        self._entries = 0 if seq == 0 else live + 1
+        self._pending = 0
+        return {"applied": live, "discarded": 0, "seq": seq}
+
+    def _write_compact_candidate(self, image: bytes) -> None:
+        """Durably stage the compacted image as the ``wal.cmp`` sidecar."""
+
+        def write(f):
+            f.write(image)
+
+        self._atomic_file(self._cmp_path, write)
 
     def stats(self) -> dict:
         self._ensure_open()

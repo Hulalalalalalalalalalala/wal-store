@@ -26,6 +26,9 @@ line subcommand creates it).
 - `delete(key) -> None` records a removal.
 - `commit() -> int` advances the durable sequence number.
 - `recover() -> dict` replays the log and reports what it applied.
+- `compact() -> dict` rewrites committed history into one tight log and
+  reclaims the old space, without changing the committed state or the
+  durable sequence.
 - `stats() -> dict` reports sequence, entries and bytes.
 
 `wal_store.Store(path, read_only=True)` opens an isolated reader. Any
@@ -100,6 +103,44 @@ the same key order and a trailing newline, e.g.
 error and the exit code is `0`; corruption prints one explanatory line to
 standard error and exits `3` without printing the JSON line.
 
+## Compaction
+
+`compact()` reclaims history without sacrificing any committed state. When
+it finishes, the log contains exactly the live committed key/values: one
+put frame per currently committed key, in sorted key order, followed by a
+base commit marker that carries the pre-compaction sequence. Deleted keys
+are gone for good — a deleted key can never reappear — and overwritten keys
+keep only their final value. The durable sequence number is unchanged, so
+the next `commit()` writes `seq + 1` and subsequent commits continue the
+strict sequence as if no rewrite had happened. The empty committed state
+(including "everything was deleted") compacts to an empty log.
+
+`compact()` returns the same three-field report shape as `recover()`:
+`applied` is the number of live puts the new log contains, `discarded` is
+always `0` and `seq` is the preserved sequence. Uncommitted session changes
+make it raise `ValueError`; commit or discard them first.
+
+Compaction is a kill-safe, idempotent convergence like recovery. The new
+image is assembled in memory and durably staged as the `wal.cmp` sidecar
+(an atomically replaced complete file, never an in-place edit), then
+published in two atomic steps — `wal.ckp` first and `wal.log` second —
+before the staging file is removed. A process killed at any point, any
+number of times, leaves a store that finishes the identical publish on the
+next open: the recovered state is exactly the last committed state, the
+sequence never regresses and the resulting log/sidecar bytes are
+byte-identical to one uninterrupted compaction. Repeating compaction on an
+already compact store produces the same bytes.
+
+Live read-only stores are unaffected: they keep serving the complete
+snapshot they pinned before, during and after compaction (it lands on the
+other half of the same log-versus-checkpoint pair readers already choose
+between), while fresh readers open the compacted snapshot. No reader ever
+sees a mix of old and new bytes, a half-written file, or content whose
+space was reclaimed; killing a reader does not disturb compaction and
+killing the compactor does not disturb a reader. Compaction introduces no
+new limits beyond the existing single-writer rule, and directories written
+by older versions compact directly with no conversion step.
+
 ## Tests
 
     python3 -m unittest discover -s tests -t .
@@ -108,4 +149,5 @@ standard error and exits `3` without printing the JSON line.
 
 One writer at a time; no cross-process locking.
 Values are bytes; encoding is the caller concern.
-No replication and no compaction.
+No replication; compaction is a writer-initiated rewrite, not background
+garbage collection.
