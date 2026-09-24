@@ -26,6 +26,8 @@ line subcommand creates it).
 - `delete(key) -> None` records a removal.
 - `commit() -> int` advances the durable sequence number.
 - `recover() -> dict` replays the log and reports what it applied.
+- `compact() -> dict` rewrites committed history into one compact log and
+  frees the old space; see [Compaction](#compaction).
 - `stats() -> dict` reports sequence, entries and bytes.
 
 `wal_store.Store(path, read_only=True)` opens an isolated reader. Any
@@ -100,6 +102,40 @@ the same key order and a trailing newline, e.g.
 error and the exit code is `0`; corruption prints one explanatory line to
 standard error and exits `3` without printing the JSON line.
 
+## Compaction
+
+`compact()` rewrites the committed history in place into one compact log
+that holds exactly one put record per key alive in the current committed
+snapshot, followed by a single *base* commit marker
+(`{"t":"c","s":seq,"b":1}`) carrying the **same** durable sequence number,
+and then releases the old log's space. After compaction:
+
+- the key/value state is byte-for-byte the last committed state;
+- the durable sequence number is unchanged and the next commit is
+  `seq + 1`;
+- keys that only ever existed in deleted history do not come back, and a
+  store that never committed compacts to an empty log;
+- `recover()` still reports its three integers (`applied` then counts the
+  live records, `discarded` is 0, `seq` is preserved).
+
+Compaction shares the store directory, commands and framing with writing,
+reading, deleting, committing, recovering and stats; it adds no
+subcommand and changes none of those semantics. It is rejected while the
+session has uncommitted changes. It is crash-safe at any byte position and
+idempotent: the compacted image is fully staged and fsynced as `wal.cmp`
+with a plan marker `wal.cpr` published atomically before any reader-visible
+file is replaced; the checkpoint is replaced first and the log immediately
+after, each by an atomic rename of a fully fsynced temp file. A kill at any
+point leaves only whole files, and reopening (or calling `compact()` again)
+converges to exactly the bytes one clean compaction produces, regardless of
+how many times it was interrupted. Read-only processes never open the
+staging files and serve their pinned snapshot from memory, so a reader alive
+before and after the compaction reads one complete committed snapshot each
+time, never a mixture, a half state or released bytes; a killed reader does
+not affect compaction and a compaction killed mid-publish does not affect
+readers. Directories written by older versions open and compact without
+conversion.
+
 ## Tests
 
     python3 -m unittest discover -s tests -t .
@@ -108,4 +144,4 @@ standard error and exits `3` without printing the JSON line.
 
 One writer at a time; no cross-process locking.
 Values are bytes; encoding is the caller concern.
-No replication and no compaction.
+No replication.

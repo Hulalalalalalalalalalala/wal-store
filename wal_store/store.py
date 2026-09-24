@@ -33,6 +33,40 @@ make the convergence protocol kill-safe and its report stable:
     stable across reopens and repeated recoveries. It is removed by the next
     successful commit.
 
+Compaction (``Store.compact()``) rewrites the committed history into one
+compact log holding exactly the live key/value records plus a single commit
+marker carrying the *same* durable sequence number, and releases the old
+log's space. It uses the same atomic-publish machinery and two more
+sidecars, both kept out of the reader path:
+
+``wal.cmp``
+    The fully written, fsynced compacted image: one put frame per live key
+    in first-write order followed by one *base* commit marker (``"b":1``)
+    carrying the preserved sequence. It is staged as a temp file and
+    atomically renamed, so it is either absent or a complete compacted
+    snapshot -- never a half image.
+
+``wal.cpr``
+    The compaction plan marker, written only after ``wal.cmp`` is durable
+    and only *before* the publish. It records the compacted image length,
+    its sequence and the old log/sidecar byte lengths the plan was computed
+    from. Its presence makes a compaction killed at any byte converge on
+    reopen: the plan is only honoured while it still matches the image and
+    the files it was built from, so a kill followed by new writer activity
+    can never install a stale image; a stale plan is discarded and the
+    compacted image rebuilt. It is removed when the publish completes.
+
+The publish itself never edits a file readers can see in place: the
+checkpoint and the log are each replaced atomically (temp, fsync, rename),
+and the new log is installed only after the new checkpoint already covers
+it. A read-only process scans its chosen image once into memory and closes
+the files at open, so a reader that pinned the old snapshot keeps serving
+every byte of it from that index even after the old space is released, and
+every fresh read-only open sees either the old or the new complete
+committed snapshot, at the same sequence number, never a mix, a half state
+or released bytes.
+
+
 Read-only processes (``Store(path, read_only=True)``) take no lock and never
 create or modify a file. At open each one picks the highest committed prefix
 available at that instant -- the validated ``wal.log`` prefix or ``wal.ckp``
@@ -67,6 +101,10 @@ a genuinely short final header reads as a torn tail.
 Metadata is a compact JSON object: ``{"t":"p","k":key}`` for puts,
 ``{"t":"d","k":key}`` for deletes and ``{"t":"c","s":seq}`` for commits.
 The raw value bytes follow the first newline, so values need no encoding.
+A compacted log's single commit marker additionally carries ``"b":1``: it
+is a *base* commit that snapshots the whole live state at its sequence
+number, so its sequence need not be one (ordinary, non-base commits still
+form the strictly increasing 1, 2, 3, ... chain).
 """
 
 from __future__ import annotations
@@ -92,6 +130,8 @@ class CorruptLogError(ValueError):
 LOG_NAME = "wal.log"
 _CHECKPOINT_NAME = "wal.ckp"
 _MARKER_NAME = "wal.rec"
+_COMPACT_NAME = "wal.cmp"
+_COMPACT_PLAN_NAME = "wal.cpr"
 
 _MAGIC = b"WAL2"
 _PREFIX = 12  # 4 bytes magic + 8 bytes payload length
@@ -105,12 +145,14 @@ _OP_COMMIT = "c"
 
 
 def _encode_frame(op: str, value: bytes = b"", key: str | None = None,
-                  seq: int | None = None) -> bytes:
+                  seq: int | None = None, base: bool = False) -> bytes:
     meta: dict[str, object] = {"t": op}
     if key is not None:
         meta["k"] = key
     if seq is not None:
         meta["s"] = seq
+    if base:
+        meta["b"] = 1
     head = json.dumps(meta, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     payload = head + b"\n" + value
     prefix = _MAGIC + len(payload).to_bytes(8, "big")
@@ -275,6 +317,8 @@ class Store:
         self._path = os.path.join(path, LOG_NAME)
         self._ckp_path = os.path.join(path, _CHECKPOINT_NAME)
         self._marker_path = os.path.join(path, _MARKER_NAME)
+        self._compact_path = os.path.join(path, _COMPACT_NAME)
+        self._compact_plan_path = os.path.join(path, _COMPACT_PLAN_NAME)
         self._read_only = read_only
 
         # Recovery needs a directory to replay; a missing target is an error
@@ -334,28 +378,69 @@ class Store:
         terminal is corruption and raises ``CorruptLogError``; a ``"torn"``
         terminal is left for the caller, which decides from the durable
         checkpoint whether it is a tail to discard or a gash to restore.
+
+        The first commit marker of a compacted log carries ``"b":1``: it is
+        a *base* commit snapshotting the whole live state, so its sequence
+        may be any positive value (the sequence preserved across
+        compaction); later commits then continue at ``seq + 1``. All frames
+        before such a base commit must be puts with distinct keys -- the
+        compacted snapshot -- and the base must be the first commit. An
+        ordinary first commit still has to be sequence 1 and every later
+        non-base commit must advance by exactly one.
         """
         expected_seq = 1
         last_seq = 0
         committed_end = 0
-        for meta, _value, _start, end in frames:
+        commits_seen = 0
+        for index, (meta, _value, _start, end) in enumerate(frames):
             op = meta.get("t")
             if op in (_OP_PUT, _OP_DELETE):
                 key = meta.get("k")
                 if not isinstance(key, str) or key == "":
                     raise CorruptLogError(
                         f"invalid frame metadata: {meta!r}")
+                if "b" in meta:
+                    raise CorruptLogError(
+                        f"base flag on a non-commit frame: {meta!r}")
             elif op == _OP_COMMIT:
                 seq = meta.get("s")
                 if not isinstance(seq, int) or isinstance(seq, bool):
                     raise CorruptLogError(
                         f"invalid commit marker: {meta!r}")
-                if seq != expected_seq:
+                flag = meta.get("b")
+                if flag is not None and not (
+                        isinstance(flag, int) and not isinstance(flag, bool)
+                        and flag == 1):
+                    raise CorruptLogError(
+                        f"invalid base flag on commit marker: {meta!r}")
+                base = flag == 1
+                if base:
+                    if commits_seen != 0:
+                        raise CorruptLogError(
+                            "base commit must be the first commit marker")
+                    if seq < 1:
+                        raise CorruptLogError(
+                            f"base commit sequence out of range: {seq}")
+                    snapshot_keys: set[str] = set()
+                    for pre in frames[:index]:
+                        pre_meta = pre[0]
+                        if pre_meta.get("t") != _OP_PUT:
+                            raise CorruptLogError(
+                                "compacted base snapshot contains a delete")
+                        pre_key = pre_meta["k"]
+                        if pre_key in snapshot_keys:
+                            raise CorruptLogError(
+                                "compacted base snapshot repeats a key")
+                        snapshot_keys.add(pre_key)
+                    expected_seq = seq + 1
+                elif seq != expected_seq:
                     raise CorruptLogError(
                         f"commit sequence {seq} out of order, "
                         f"expected {expected_seq}")
+                else:
+                    expected_seq += 1
+                commits_seen += 1
                 last_seq = seq
-                expected_seq += 1
                 committed_end = end
             else:
                 raise CorruptLogError(f"unknown frame type: {op!r}")
@@ -469,9 +554,252 @@ class Store:
             return
         _fsync_dir(self._dir)
 
+    # -- compaction sidecars ----------------------------------------------
+
+    def _write_compact_plan(self, seq: int, length: int,
+                            log_size: int, ckp_size: int) -> None:
+        payload = json.dumps(
+            {"s": seq, "n": length, "log": log_size, "ckp": ckp_size},
+            separators=(",", ":")).encode("utf-8")
+
+        def write(f):
+            f.write(payload)
+
+        self._atomic_file(self._compact_plan_path, write)
+
+    def _read_compact_plan(self):
+        """Return ``(seq, length, log_size, ckp_size)`` or ``None``.
+
+        A torn or malformed plan is corruption of the convergence machinery,
+        not a discardable tail: the plan itself is always atomically
+        replaced, so it cannot be half-written by a kill.
+        """
+        try:
+            with open(self._compact_plan_path, "rb") as f:
+                raw = f.read()
+        except FileNotFoundError:
+            return None
+        try:
+            plan = json.loads(raw)
+            seq = plan["s"]
+            length = plan["n"]
+            log_size = plan["log"]
+            ckp_size = plan["ckp"]
+        except (ValueError, TypeError, KeyError):
+            raise CorruptLogError("unparseable compaction plan")
+
+        def ok(v, allow_minus_one=False) -> bool:
+            return (isinstance(v, int) and not isinstance(v, bool)
+                    and v >= (-1 if allow_minus_one else 0))
+
+        if (not ok(seq) or not ok(length) or not ok(log_size)
+                or not ok(ckp_size, allow_minus_one=True)):
+            raise CorruptLogError("invalid compaction plan")
+        return seq, length, log_size, ckp_size
+
+    def _read_compact_image(self, seq: int, length: int):
+        """Validate ``wal.cmp`` as the exact compacted image of ``seq``.
+
+        Returns its frames. The image must parse as one exact committed
+        prefix ending in a single *base* commit carrying ``seq`` (an empty
+        zero-length image is the compacted form of the never-committed
+        store, seq 0); anything else is corruption of the machinery.
+        """
+        try:
+            image = self._read_clean_prefix(self._compact_path)
+        except FileNotFoundError:
+            image = None
+        if image is None:
+            raise CorruptLogError(
+                "compaction plan without its compacted image")
+        frames, end, image_seq = image
+        if end != length or image_seq != seq:
+            raise CorruptLogError("compaction image does not match its plan")
+        if length == 0:
+            if seq != 0 or frames:
+                raise CorruptLogError("invalid empty compaction image")
+            return frames
+        base = next((meta for meta, _v, _s, _e in frames
+                     if meta.get("t") == _OP_COMMIT), None)
+        if base is None or base.get("b") != 1:
+            raise CorruptLogError("compaction image is missing its base commit")
+        if any(meta.get("t") == _OP_COMMIT for meta, _v, _s, _e in
+               frames[:-1]) or frames[-1][0].get("t") != _OP_COMMIT:
+            raise CorruptLogError("compaction image has extra commit markers")
+        return frames
+
+    def _remove_compaction_sidecars(self) -> None:
+        for name in (self._compact_plan_path, self._compact_path):
+            try:
+                os.unlink(name)
+            except FileNotFoundError:
+                pass
+        _fsync_dir(self._dir)
+
+    def _install_log_from(self, src_path: str, length: int) -> None:
+        """Atomically replace the log with ``[0, length)`` of ``src_path``.
+
+        Mirrors the checkpoint rebuild: the replacement is fully written
+        and fsynced as a temp file, so a kill leaves either the old log or
+        the complete new one -- never a half-written file -- and rerunning
+        converges. The append fd is closed for the rename (Windows cannot
+        rename over a path it holds) and reopened afterwards.
+        """
+        tmp = self._path + ".tmp"
+        with open(src_path, "rb") as fsrc, open(tmp, "wb") as fdst:
+            self._copy_prefix(fsrc, fdst, length)
+            os.fsync(fdst.fileno())
+        os.close(self._fd)
+        try:
+            os.replace(tmp, self._path)
+            _fsync_dir(self._dir)
+        finally:
+            self._fd = os.open(
+                self._path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        if os.fstat(self._fd).st_size != length:
+            raise CorruptLogError("compaction did not converge")
+
+    def _prepare_compaction(self, plan):
+        """Make the staged image match an interrupted plan, or declare stale.
+
+        Returns the compacted image's frames when the plan can still be
+        finished, and ``None`` when a strictly newer durable commit makes it
+        obsolete (the caller discards the plan/image and recovers
+        normally).
+
+        Convergence at *any* byte position is the point: the compacted
+        image is a deterministic function of the committed state, so a torn
+        or missing ``wal.cmp`` is simply regenerated from whichever intact
+        committed source still carries the plan's sequence -- the log's
+        committed prefix or the checkpoint -- and a torn checkpoint/log is
+        overwritten by the publish anyway. Genuine ambiguity -- no intact
+        source at the plan's sequence, or a regenerated image whose length
+        disagrees with the plan -- is ``CorruptLogError``. A newer commit
+        cannot be hidden: every commit durably advances either the log
+        boundary or the atomically replaced checkpoint, and the single
+        writer always finishes a pending plan at open before appending.
+        """
+        seq, length, _log_size, _ckp_size = plan
+
+        frames, terminal = self._read_log()
+        log_end, log_seq = self._validate(frames, terminal)
+
+        ckp = None
+        if os.path.exists(self._ckp_path):
+            try:
+                ckp = self._read_clean_prefix(self._ckp_path)
+            except CorruptLogError:
+                # A torn or damaged checkpoint is repairable only while the
+                # log itself pins the plan's sequence.
+                ckp = "damaged"
+        ckp_seq = ckp[2] if isinstance(ckp, tuple) else 0
+
+        durable_seq = max(log_seq, ckp_seq)
+        if durable_seq > seq:
+            return None
+        if durable_seq < seq:
+            raise CorruptLogError(
+                "compaction plan has no committed source at its sequence")
+
+        if log_seq == seq:
+            # The committed prefix is intact even when a torn or merely
+            # uncommitted tail follows it (an "invalid" terminal already
+            # raised in _validate); replay exactly the committed frames.
+            source = [fr for fr in frames if fr[3] <= log_end]
+        elif isinstance(ckp, tuple) and ckp_seq == seq:
+            source = ckp[0]
+        else:
+            raise CorruptLogError(
+                "no intact committed source to finish compaction")
+
+        state, _applied = self._replay(source)
+        parts = [_encode_frame(_OP_PUT, value=value, key=key)
+                 for key, value in state.items()]
+        if seq:
+            parts.append(_encode_frame(_OP_COMMIT, seq=seq, base=True))
+        image = b"".join(parts)
+        if len(image) != length:
+            raise CorruptLogError(
+                "compaction plan does not match the committed state")
+
+        # Keep an already-published, valid image; otherwise republish the
+        # regenerated one atomically before touching any reader-visible
+        # file.
+        image_ok = False
+        try:
+            existing = self._read_clean_prefix(self._compact_path)
+        except CorruptLogError:
+            existing = None
+        if existing is None:
+            image_ok = False
+        else:
+            ex_frames, ex_end, ex_seq = existing
+            image_ok = (
+                ex_end == length and ex_seq == seq and
+                (length == 0 or (
+                    ex_frames[-1][0].get("t") == _OP_COMMIT
+                    and ex_frames[-1][0].get("b") == 1
+                    and all(m.get("t") == _OP_PUT
+                            for m, _v, _s, _e in ex_frames[:-1]))))
+        if not image_ok:
+            def write_image(f):
+                f.write(image)
+
+            self._atomic_file(self._compact_path, write_image)
+
+        return self._read_compact_image(seq, length)
+
+    def _finish_compaction(self, plan):
+        """Publish the staged compacted image; idempotent and kill-safe.
+
+        The checkpoint is replaced first, so a complete restorable image is
+        published before the old log is unlinked; the log is installed from
+        the same bytes immediately afterwards. Each step is an atomic
+        rename of a fully fsynced temp file, so a kill at any point leaves
+        whole files only and rerunning repeats the same publish.
+        """
+        seq, length, _log_size, _ckp_size = plan
+        if length:
+            def write_checkpoint(fdst):
+                with open(self._compact_path, "rb") as fsrc:
+                    self._copy_prefix(fsrc, fdst, length)
+
+            self._atomic_file(self._ckp_path, write_checkpoint)
+        else:
+            try:
+                os.unlink(self._ckp_path)
+                _fsync_dir(self._dir)
+            except FileNotFoundError:
+                pass
+
+        self._install_log_from(self._compact_path, length)
+        # The compacted snapshot closes any open recovery epoch: the torn
+        # tail it recorded is history that no longer exists.
+        self._remove_marker()
+        # Drop the plan before its image, so a kill in between can never
+        # leave a plan that points at a missing image.
+        try:
+            os.unlink(self._compact_plan_path)
+        except FileNotFoundError:
+            pass
+        _fsync_dir(self._dir)
+        try:
+            os.unlink(self._compact_path)
+        except FileNotFoundError:
+            pass
+        _fsync_dir(self._dir)
+
+        frames, terminal = self._read_log()
+        end, published_seq = self._validate(frames, terminal)
+        if end != length or published_seq != seq or terminal is not None:
+            raise CorruptLogError("compaction did not converge")
+        return frames, 0
+
     def _remove_stale_temps(self) -> None:
         for name in (self._path + ".tmp", self._ckp_path + ".tmp",
-                     self._marker_path + ".tmp"):
+                     self._marker_path + ".tmp",
+                     self._compact_path + ".tmp",
+                     self._compact_plan_path + ".tmp"):
             try:
                 os.unlink(name)
             except FileNotFoundError:
@@ -547,6 +875,27 @@ class Store:
         next commit even when the kill lands mid-repair.
         """
         self._remove_stale_temps()
+
+        # A compaction interrupted at any point converges before any other
+        # repair: its plan is only honoured while it still matches the exact
+        # files it was published between, so a kill followed by newer
+        # activity simply discards the stale plan and image and continues
+        # with normal recovery from the newer commit.
+        plan = self._read_compact_plan()
+        if plan is not None:
+            if self._prepare_compaction(plan) is not None:
+                return self._finish_compaction(plan)
+            self._remove_compaction_sidecars()
+        elif os.path.exists(self._compact_path):
+            # No plan means the publish already completed (the plan is only
+            # removed once the new checkpoint and log are both installed);
+            # a kill before the image unlink left this orphan.
+            try:
+                os.unlink(self._compact_path)
+                _fsync_dir(self._dir)
+            except FileNotFoundError:
+                pass
+
         marker = self._read_marker()
         marker_end = -1
         marker_discarded = 0
@@ -554,7 +903,7 @@ class Store:
             marker_end, marker_discarded = marker
 
         frames, terminal = self._read_log()
-        log_end, _log_seq = self._validate(frames, terminal)
+        log_end, log_seq = self._validate(frames, terminal)
         ckp_end = self._checkpoint_boundary()
         size = os.fstat(self._fd).st_size
 
@@ -834,6 +1183,72 @@ class Store:
         self._discarded = discarded
         self._corrupt = False
         return {"applied": applied, "discarded": discarded, "seq": seq}
+
+    def compact(self) -> dict:
+        """Rewrite committed history into one compact log and free the old.
+
+        After compaction the log holds exactly one committed record per key
+        alive in the current committed snapshot, followed by a single base
+        commit marker carrying the *same* durable sequence number, so the
+        sequence never moves and the next commit is still ``seq + 1``. The
+        old log's space is released; a store that never committed compacts
+        to an empty log, and keys only ever present in deleted history do
+        not come back.
+
+        Compaction is kill-safe at every byte and idempotent: the compacted
+        image is fully staged and fsynced as ``wal.cmp`` and a plan marker
+        ``wal.cpr`` is atomically published before any reader-visible file
+        is replaced, whereupon the checkpoint and log are each replaced
+        atomically. A kill at any point leaves only whole files, and
+        reopening (or calling ``compact`` again) converges to exactly the
+        bytes one clean compaction produces. Read-only processes never open
+        the staging files, so a pinned reader keeps its old snapshot while a
+        new reader sees either complete snapshot, never a mixture.
+
+        Requires a clean session: uncommitted pending mutations are
+        rejected, exactly as for ``recover``. Returns the post-compaction
+        stats: ``{"seq", "entries", "bytes"}``.
+        """
+        self._ensure_writable()
+        if self._pending:
+            raise ValueError(
+                "cannot compact with uncommitted changes in this session")
+
+        # Finish (or discard and redo) any compaction a kill interrupted and
+        # converge ordinary torn-tail repairs first, so the image is built
+        # from one fully committed state.
+        frames, _discarded = self._converge()
+        state, _applied = self._replay(frames)
+        seq = max(
+            (meta["s"] for meta, _v, _s, _e in frames
+             if meta.get("t") == _OP_COMMIT),
+            default=0)
+
+        parts = [_encode_frame(_OP_PUT, value=value, key=key)
+                 for key, value in state.items()]
+        if seq:
+            parts.append(_encode_frame(_OP_COMMIT, seq=seq, base=True))
+        image = b"".join(parts)
+        length = len(image)
+
+        log_size = os.fstat(self._fd).st_size
+        try:
+            ckp_size = os.path.getsize(self._ckp_path)
+        except FileNotFoundError:
+            ckp_size = -1
+
+        def write_image(f):
+            f.write(image)
+
+        # Image first, plan second: a kill between them leaves a harmless
+        # orphan the next open removes; a plan never points at a missing or
+        # partial image.
+        self._atomic_file(self._compact_path, write_image)
+        self._write_compact_plan(seq, length, log_size, ckp_size)
+        frames, _discarded = self._finish_compaction((
+            seq, length, log_size, ckp_size))
+        self._publish(frames, 0)
+        return self.stats()
 
     def stats(self) -> dict:
         self._ensure_open()
