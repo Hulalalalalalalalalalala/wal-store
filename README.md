@@ -28,6 +28,21 @@ line subcommand creates it).
 - `recover() -> dict` replays the log and reports what it applied.
 - `stats() -> dict` reports sequence, entries and bytes.
 
+`wal_store.Store(path, read_only=True)` opens an isolated reader. Any
+number of read-only processes may coexist with the single writer in the
+same directory. A reader takes no lock and never creates or changes a
+file; it pins a snapshot at open time and every `get` reads from that one
+complete committed snapshot, so uncommitted mutations, a half-written
+commit, a torn record or a half-finished shrink are never visible.
+Successive reads from the same reader may advance across snapshots only by
+reopening; each read is of one fully committed snapshot. Reads do not
+replay the log and do not block the writer: killing or suspending a reader
+never affects the writer's commits, recovery or stats. `put`, `delete`,
+`commit` and `recover` are rejected on a read-only store; `stats` reports
+the pinned snapshot and `get` is the normal way to read it. Readers serve
+from the atomically replaced `wal.ckp` sidecar (and the committed log
+prefix), so directories written by older versions open directly.
+
 `wal_store.inject_tear(source, destination, offset)` is a verification aid:
 it writes a byte-for-byte copy of `source` cut at exactly `offset` bytes (a
 replica of a process killed at that write position) to `destination` and

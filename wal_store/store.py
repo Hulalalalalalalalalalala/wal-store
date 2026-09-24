@@ -21,7 +21,8 @@ make the convergence protocol kill-safe and its report stable:
     marker, replaced atomically (temp file, fsync, rename, directory fsync)
     only after that commit frame is durable. A log torn at *any* offset --
     even offset 0, or inside the committed prefix -- is rebuilt from it, so
-    the durable sequence number never regresses.
+    the durable sequence number never regresses. It is also the published
+    snapshot read-only processes pin (see below).
 
 ``wal.rec``
     A recovery marker written only after a log needing repair has passed
@@ -31,6 +32,19 @@ make the convergence protocol kill-safe and its report stable:
     rebuild is simply repeated) and keeps the reported ``discarded`` count
     stable across reopens and repeated recoveries. It is removed by the next
     successful commit.
+
+Read-only processes (``Store(path, read_only=True)``) take no lock and never
+create or modify a file. At open each one picks the highest committed prefix
+available at that instant -- the validated ``wal.log`` prefix or ``wal.ckp``
+-- scans it once into memory and serves every ``get`` from that index.
+Because the chosen image is complete and is only ever replaced atomically
+(never edited in place), a refresh caught mid-rename, a half-written commit,
+a torn record, or a log being rebuilt or shrunk can never expose partial
+bytes: each read lands on one full committed snapshot that was current at or
+after the open. A directory written by an older version is opened the same
+way from its log and checkpoint. Reads never replay the log afterwards, so
+their cost is independent of history and they never block the writer; a
+reader that is killed or simply hangs changes nothing on disk.
 
 The durable commit boundary is the highest of the validated log boundary,
 the checkpoint boundary and the marker boundary, so it can never move
@@ -242,13 +256,26 @@ class Store:
     created on first use. Opening a missing directory raises
     ``FileNotFoundError`` and opening a path that is not a directory raises
     ``OSError``.
+
+    With ``read_only=True`` the store is opened purely for reading. No file
+    is ever created or modified, and no lock is taken: any number of
+    read-only processes may coexist with the one writer. The reader pins the
+    committed snapshot current at open time -- the highest committed prefix
+    of ``wal.log`` or of the atomically replaced ``wal.ckp`` sidecar --
+    scans it once, and serves every ``get`` from that in-memory index. The
+    snapshot is independent of the log's later history, so a read never
+    replays the log and cannot block the writer, and uncommitted bytes, a
+    half-written commit, a torn record or a half-finished rebuild are never
+    visible. ``put``, ``delete``, ``commit`` and ``recover`` are rejected on
+    a read-only store; ``stats`` reports the pinned snapshot.
     """
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, read_only: bool = False):
         self._dir = path
         self._path = os.path.join(path, LOG_NAME)
         self._ckp_path = os.path.join(path, _CHECKPOINT_NAME)
         self._marker_path = os.path.join(path, _MARKER_NAME)
+        self._read_only = read_only
 
         # Recovery needs a directory to replay; a missing target is an error
         # at open time, not an implicit create.
@@ -257,13 +284,6 @@ class Store:
                 f"store directory does not exist: {path!r}")
         if not os.path.isdir(path):
             raise OSError(f"store path is not a directory: {path!r}")
-
-        log_created = not os.path.exists(self._path)
-        self._fd = os.open(self._path, os.O_WRONLY | os.O_CREAT | os.O_APPEND,
-                           0o644)
-        if log_created:
-            os.fsync(self._fd)
-            _fsync_dir(path)
 
         self._data: dict[str, bytes] = {}
         self._seq = 0
@@ -274,6 +294,20 @@ class Store:
         # Torn records dropped in this recovery epoch; wal.rec carries it
         # across processes until the next commit.
         self._discarded = 0
+
+        if read_only:
+            # A read-only open holds no writable fd and never takes a lock;
+            # leave the writer fd slot unset for clarity.
+            self._fd = -1
+            self._open_read_only()
+            return
+
+        log_created = not os.path.exists(self._path)
+        self._fd = os.open(self._path, os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+                           0o644)
+        if log_created:
+            os.fsync(self._fd)
+            _fsync_dir(path)
 
         self._converge_on_open()
 
@@ -598,6 +632,103 @@ class Store:
             return
         self._publish(frames, discarded)
 
+    # -- read-only opens --------------------------------------------------
+
+    def _open_read_only(self) -> None:
+        """Pin a committed snapshot without creating or modifying anything.
+
+        No lock is taken and nothing on disk is written. The reader chooses
+        the highest committed prefix available at the instant it opens --
+        the validated prefix of ``wal.log`` or the existing ``wal.ckp``
+        sidecar, which the writer replaces atomically as part of every
+        commit -- scans that prefix once into memory, and serves every
+        ``get`` from that index. Later reads are independent of log history,
+        never replay the log and never block the writer.
+
+        The checkpoint is a complete, self-contained image that is never
+        modified in place (only atomically replaced), so reading it cannot
+        expose uncommitted bytes, a half-written commit, a torn record or a
+        half-finished rebuild/shrink. It is also what makes the pin safe once
+        the reader closes the file: the image survives any later rename.
+        """
+        frames, end, seq = self._choose_readonly_prefix()
+        state, _applied = self._replay(frames)
+        self._ro_index: dict[str, bytes] = state
+        self._ro_seq = seq
+        self._ro_entries = len(frames)
+        self._ro_bytes = end
+
+    def _choose_readonly_prefix(self):
+        """Return ``(frames, end, seq)`` for the highest committed snapshot.
+
+        Takes the higher of the validated log boundary and the checkpoint
+        boundary, mirroring the writer's durable-boundary rule. A torn or
+        merely uncommitted tail past the last commit is excluded; a framing
+        or sequence failure in committed bytes is corruption and raises
+        ``CorruptLogError``. The checkpoint is the source when a crash or a
+        concurrent rebuild has torn/shrunk the committed log bytes.
+        """
+        log_frames = None
+        log_end = -1
+        log_seq = 0
+        if os.path.exists(self._path):
+            frames, terminal = self._read_log(self._path)
+            log_end, log_seq = self._validate(frames, terminal)
+            # Keep only frames at or before the last commit; the torn final
+            # record already arrives as the terminal, not as a frame.
+            log_frames = [fr for fr in frames if fr[3] <= log_end]
+
+        ckp = self._read_clean_prefix(self._ckp_path)
+        if ckp is None:
+            if log_frames is None:
+                return [], 0, 0
+            return log_frames, log_end, log_seq
+
+        ckp_frames, ckp_end, ckp_seq = ckp
+        if log_end >= ckp_end:
+            return log_frames, log_end, log_seq
+        return ckp_frames, ckp_end, ckp_seq
+
+    def _read_clean_prefix(self, path: str):
+        """Validate ``path`` as an exact committed prefix.
+
+        Returns ``(frames, end, seq)`` or ``None`` if the file is absent.
+        Raises ``CorruptLogError`` when it exists but is not exactly a clean
+        committed prefix: such a sidecar is replaced atomically, so a torn
+        or unparseable image cannot be a publish caught mid-flight. The size
+        used for the "bytes past its commit" check is taken from the same
+        open inode that was scanned, so a concurrent atomic replace can
+        never mix the bytes of one version with the size of another.
+        """
+        try:
+            f = open(path, "rb")
+        except FileNotFoundError:
+            return None
+        with f:
+            frames = []
+            terminal = None
+            for event in _iter_frames(f):
+                if event[0] == "frame":
+                    _, meta, value, start, end = event
+                    frames.append((meta, value, start, end))
+                else:
+                    terminal = event
+            size = os.fstat(f.fileno()).st_size
+        if terminal is not None:
+            raise CorruptLogError("sidecar is not a clean committed prefix")
+        if not frames:
+            if size == 0:
+                return frames, 0, 0
+            raise CorruptLogError("sidecar is not a clean committed prefix")
+        end, seq = self._validate(frames, None)
+        if end != size:
+            raise CorruptLogError("sidecar has bytes past its commit")
+        return frames, end, seq
+
+    def _read_key(self, key: str) -> bytes | None:
+        value = self._ro_index.get(key)
+        return None if value is None else bytes(value)
+
     # -- argument validation ----------------------------------------------
 
     @staticmethod
@@ -613,6 +744,8 @@ class Store:
 
     def _ensure_writable(self) -> None:
         self._ensure_open()
+        if self._read_only:
+            raise ValueError("store is opened read-only")
         if self._corrupt:
             raise CorruptLogError(
                 "log is corrupt; call recover() to diagnose before writing")
@@ -632,6 +765,8 @@ class Store:
     def get(self, key: str) -> bytes | None:
         self._ensure_open()
         self._check_key(key)
+        if self._read_only:
+            return self._read_key(key)
         return self._data.get(key)
 
     def delete(self, key: str) -> None:
@@ -677,6 +812,8 @@ class Store:
         as one clean recovery, and the next commit always uses ``seq + 1``.
         """
         self._ensure_open()
+        if self._read_only:
+            raise ValueError("cannot recover a store opened read-only")
         if self._pending:
             raise ValueError(
                 "cannot recover with uncommitted changes in this session")
@@ -700,6 +837,14 @@ class Store:
 
     def stats(self) -> dict:
         self._ensure_open()
+        if self._read_only:
+            # The pinned snapshot's sequence, frame count and byte size; it
+            # does not move as the writer appends later history.
+            return {
+                "seq": self._ro_seq,
+                "entries": self._ro_entries,
+                "bytes": self._ro_bytes,
+            }
         return {
             "seq": self._seq,
             "entries": self._entries,
@@ -709,7 +854,8 @@ class Store:
     def close(self) -> None:
         if self._closed:
             return
-        os.close(self._fd)
+        if not self._read_only:
+            os.close(self._fd)
         self._closed = True
 
     def __enter__(self) -> "Store":

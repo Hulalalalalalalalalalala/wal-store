@@ -48,7 +48,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         if args.command == "get":
-            with Store(args.path) as store:
+            # Read-only: many get processes may run alongside the one writer
+            # and never modify the store.
+            with Store(args.path, read_only=True) as store:
                 value = store.get(args.key)
             if value is None:
                 return 1
