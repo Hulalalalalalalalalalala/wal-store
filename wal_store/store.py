@@ -12,6 +12,32 @@ length field out of bounds, unparseable content, or a duplicate/regressing
 commit sequence -- is corruption, and recovery raises ``CorruptLogError``
 without touching the store.
 
+Recovery itself may be killed at any point, any number of times. Two small
+sidecar files in the store directory, both maintained below the write path,
+make the convergence protocol kill-safe and its report stable:
+
+``wal.ckp``
+    A byte-for-byte copy of the log prefix ending at the most recent commit
+    marker, replaced atomically (temp file, fsync, rename, directory fsync)
+    only after that commit frame is durable. A log torn at *any* offset --
+    even offset 0, or inside the committed prefix -- is rebuilt from it, so
+    the durable sequence number never regresses.
+
+``wal.rec``
+    A recovery marker written only after a log needing repair has passed
+    full validation and only *before* the atomic rebuild starts. It records
+    the clean prefix length and whether a torn record was discarded. Its
+    presence makes a rebuild interrupted mid-copy converge on reopen (the
+    rebuild is simply repeated) and keeps the reported ``discarded`` count
+    stable across reopens and repeated recoveries. It is removed by the next
+    successful commit.
+
+The durable commit boundary is the highest of the validated log boundary,
+the checkpoint boundary and the marker boundary, so it can never move
+backwards. Every repair step is either idempotent or an atomic rename; a
+kill between any two steps leaves a state the next open converges from to
+the identical result.
+
 Log frame layout (all integers big-endian)::
 
     +---------+----------------+------------+----------------------+---------+
@@ -33,9 +59,10 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import zlib
 
-__all__ = ["Store", "CorruptLogError"]
+__all__ = ["Store", "CorruptLogError", "inject_tear"]
 
 
 class CorruptLogError(ValueError):
@@ -49,6 +76,8 @@ class CorruptLogError(ValueError):
 
 
 LOG_NAME = "wal.log"
+_CHECKPOINT_NAME = "wal.ckp"
+_MARKER_NAME = "wal.rec"
 
 _MAGIC = b"WAL2"
 _PREFIX = 12  # 4 bytes magic + 8 bytes payload length
@@ -139,9 +168,22 @@ def _iter_frames(f):
 
 
 def _fsync_dir(path: str) -> None:
+    """Fsync a directory so a nearby rename/unlink is durable.
+
+    Windows cannot open directories for fsync and raises ``PermissionError``
+    (access denied); directory entries there are made durable by the file's
+    own flush-on-rename, so skipping the directory fsync keeps store creation
+    working everywhere.
+    """
+    if sys.platform == "win32":
+        return
     fd = os.open(path, os.O_RDONLY)
     try:
-        os.fsync(fd)
+        try:
+            os.fsync(fd)
+        except PermissionError:
+            # Some non-Windows mounts reject directory fsync the same way.
+            pass
     finally:
         os.close(fd)
 
@@ -150,6 +192,47 @@ def _write_all(fd: int, data: bytes) -> None:
     view = memoryview(data)
     while view:
         view = view[os.write(fd, view):]
+
+
+def inject_tear(source, destination, offset):
+    """Copy a log cut at exactly ``offset`` bytes, for bytewise verification.
+
+    Produces ``destination`` containing the first ``offset`` bytes of
+    ``source`` -- a replica of a process killed precisely when the write had
+    reached that byte offset. The source file is never modified. Either path
+    argument may be a store directory, in which case its ``wal.log`` is used.
+
+    ``offset`` must satisfy ``0 <= offset <= len(source)``; a negative or
+    past-the-end offset raises ``IndexError``. The full-length copy
+    (``offset == len(source)``) is the clean control case.
+
+    Verification aid only; the normal write path never calls this.
+    """
+    if not isinstance(offset, int) or isinstance(offset, bool):
+        raise TypeError("offset must be an integer byte offset")
+
+    src = os.path.join(source, LOG_NAME) if os.path.isdir(source) else source
+    dst = (os.path.join(destination, LOG_NAME)
+           if os.path.isdir(destination) else destination)
+
+    size = os.path.getsize(src)
+    if offset < 0 or offset > size:
+        raise IndexError(
+            f"tear offset {offset} out of range for log of {size} bytes")
+    if os.path.abspath(src) == os.path.abspath(dst):
+        raise ValueError("tear destination must differ from the source log")
+
+    remaining = offset
+    with open(src, "rb") as fsrc, open(dst, "wb") as fdst:
+        while remaining:
+            chunk = fsrc.read(min(remaining, 1 << 20))
+            if not chunk:  # pragma: no cover - size came from the same file
+                raise IndexError("source log shrank while copying")
+            fdst.write(chunk)
+            remaining -= len(chunk)
+        fdst.truncate(offset)
+        os.fsync(fdst.fileno())
+    return dst
 
 
 class Store:
@@ -164,6 +247,8 @@ class Store:
     def __init__(self, path: str):
         self._dir = path
         self._path = os.path.join(path, LOG_NAME)
+        self._ckp_path = os.path.join(path, _CHECKPOINT_NAME)
+        self._marker_path = os.path.join(path, _MARKER_NAME)
 
         # Recovery needs a directory to replay; a missing target is an error
         # at open time, not an implicit create.
@@ -186,18 +271,18 @@ class Store:
         self._pending = 0
         self._closed = False
         self._corrupt = False
-        # Torn records dropped while replaying at open time; recover() still
-        # reports them even though the bytes are already gone.
+        # Torn records dropped in this recovery epoch; wal.rec carries it
+        # across processes until the next commit.
         self._discarded = 0
 
-        self._load_on_open()
+        self._converge_on_open()
 
     # -- log scanning and validation --------------------------------------
 
-    def _read_log(self):
+    def _read_log(self, path=None):
         frames = []
         terminal = None
-        with open(self._path, "rb") as f:
+        with open(path or self._path, "rb") as f:
             for event in _iter_frames(f):
                 if event[0] == "frame":
                     _, meta, value, start, end = event
@@ -208,13 +293,13 @@ class Store:
 
     @staticmethod
     def _validate(frames, terminal):
-        """Validate every frame and commit ordering.
+        """Validate every frame and the strictly increasing commit sequence.
 
-        Returns ``(committed_end, last_seq, discarded)`` -- the byte offset
-        just past the last commit marker, its sequence number, and the number
-        of torn tail records dropped (zero or one). Raises
-        ``CorruptLogError`` on unknown frames, bad metadata, or any
-        gap/duplicate in the strictly increasing commit sequence.
+        Returns ``(committed_end, last_seq)`` -- the byte offset just past
+        the last commit marker and its sequence number. An ``"invalid"``
+        terminal is corruption and raises ``CorruptLogError``; a ``"torn"``
+        terminal is left for the caller, which decides from the durable
+        checkpoint whether it is a tail to discard or a gash to restore.
         """
         expected_seq = 1
         last_seq = 0
@@ -240,20 +325,15 @@ class Store:
                 committed_end = end
             else:
                 raise CorruptLogError(f"unknown frame type: {op!r}")
-        if terminal is not None:
-            if terminal[0] == "invalid":
-                raise CorruptLogError("corrupt log frame")
-            # A torn final record is the only remnant a kill can leave.
-            return committed_end, last_seq, 1
-        return committed_end, last_seq, 0
+        if terminal is not None and terminal[0] == "invalid":
+            raise CorruptLogError("corrupt log frame")
+        return committed_end, last_seq
 
     @staticmethod
-    def _replay(frames, committed_end) -> tuple[dict[str, bytes], int]:
+    def _replay(frames) -> tuple[dict[str, bytes], int]:
         state: dict[str, bytes] = {}
         applied = 0
-        for meta, value, _start, end in frames:
-            if end > committed_end:
-                break
+        for meta, value, _start, _end in frames:
             op = meta["t"]
             if op == _OP_COMMIT:
                 continue
@@ -264,35 +344,259 @@ class Store:
             applied += 1
         return state, applied
 
-    def _load_on_open(self) -> None:
-        """Crash cleanup: replay the committed prefix, drop the dirty tail.
+    # -- crash-convergence sidecars ---------------------------------------
 
-        When the log proves valid, everything past the last commit marker
-        (plus a possible torn final record) is truncated away. If the log is
-        corrupt nothing is touched and the store stays inert until a
-        ``recover`` call raises the underlying ``CorruptLogError``.
+    @staticmethod
+    def _copy_prefix(fsrc, fdst, length: int) -> None:
+        remaining = length
+        while remaining:
+            chunk = fsrc.read(min(remaining, 1 << 20))
+            if not chunk:
+                raise CorruptLogError(
+                    "source ended before the committed prefix")
+            fdst.write(chunk)
+            remaining -= len(chunk)
+        fdst.truncate(length)
+
+    def _atomic_file(self, target: str, write) -> None:
+        """Replace ``target`` atomically: temp file, fsync, rename, dir fsync."""
+        tmp = target + ".tmp"
+        with open(tmp, "wb") as f:
+            write(f)
+            os.fsync(f.fileno())
+        os.replace(tmp, target)
+        _fsync_dir(self._dir)
+
+    def _write_checkpoint(self, end: int) -> None:
+        """Persist the log prefix ``[0, end)`` as the clean checkpoint."""
+        if end <= 0:
+            return
+
+        def write(fdst):
+            with open(self._path, "rb") as fsrc:
+                self._copy_prefix(fsrc, fdst, end)
+
+        self._atomic_file(self._ckp_path, write)
+
+    def _checkpoint_boundary(self) -> int:
+        """Commit boundary the durable checkpoint covers; 0 if absent.
+
+        A checkpoint that is torn, unparseable or not exactly one committed
+        prefix is corruption of the recovery machinery rather than a discard.
         """
-        frames, terminal = self._read_log()
         try:
-            committed_end, last_seq, discarded = \
-                self._validate(frames, terminal)
+            frames, terminal = self._read_log(self._ckp_path)
+        except FileNotFoundError:
+            return 0
+        if not frames:
+            # An empty checkpoint covers the empty prefix; anything non-empty
+            # that parses to no frames is corruption.
+            if os.path.getsize(self._ckp_path) == 0 and terminal is None:
+                return 0
+            raise CorruptLogError("checkpoint is not a clean committed prefix")
+        if terminal is not None:
+            raise CorruptLogError("checkpoint is not a clean committed prefix")
+        end, _seq = self._validate(frames, None)
+        if end != os.path.getsize(self._ckp_path):
+            raise CorruptLogError("checkpoint has bytes past its commit")
+        return end
+
+    def _write_marker(self, clean_end: int, discarded: int) -> None:
+        payload = json.dumps(
+            {"end": clean_end, "discarded": discarded},
+            separators=(",", ":")).encode("utf-8")
+
+        def write(f):
+            f.write(payload)
+
+        self._atomic_file(self._marker_path, write)
+
+    def _read_marker(self):
+        try:
+            with open(self._marker_path, "rb") as f:
+                raw = f.read()
+        except FileNotFoundError:
+            return None
+        try:
+            marker = json.loads(raw)
+            end = marker["end"]
+            discarded = marker["discarded"]
+        except (ValueError, TypeError, KeyError):
+            raise CorruptLogError("unparseable recovery marker")
+        if (not isinstance(end, int) or isinstance(end, bool) or end < 0
+                or discarded not in (0, 1)):
+            raise CorruptLogError("invalid recovery marker")
+        return end, discarded
+
+    def _remove_marker(self) -> None:
+        try:
+            os.unlink(self._marker_path)
+        except FileNotFoundError:
+            return
+        _fsync_dir(self._dir)
+
+    def _remove_stale_temps(self) -> None:
+        for name in (self._path + ".tmp", self._ckp_path + ".tmp",
+                     self._marker_path + ".tmp"):
+            try:
+                os.unlink(name)
+            except FileNotFoundError:
+                pass
+
+    def _rebuild_log(self, clean_end: int) -> None:
+        """Make the log exactly its clean ``[0, clean_end)`` prefix.
+
+        Kill-safe and idempotent: when a checkpoint covers the prefix the new
+        log is fully written and fsynced as a temp file and atomically renamed
+        over the old one, so a kill leaves either the old log or the complete
+        restored log -- never a half-written file -- and rerunning converges.
+        Without a checkpoint but with the committed bytes still at stable
+        offsets, a synced truncate drops the tail instead. The empty prefix is
+        a truncate to zero.
+        """
+        size = os.fstat(self._fd).st_size
+        if size == clean_end:
+            return
+
+        if clean_end == 0:
+            os.ftruncate(self._fd, 0)
+            os.fsync(self._fd)
+            return
+
+        try:
+            ckp_size = os.path.getsize(self._ckp_path)
+        except FileNotFoundError:
+            ckp_size = -1
+
+        if ckp_size < clean_end and size > clean_end:
+            # No checkpoint, but the committed bytes survive at stable
+            # offsets: drop the dirty tail. Idempotent if killed mid-call.
+            try:
+                os.fsync(self._fd)
+            except OSError:
+                pass
+            os.ftruncate(self._fd, clean_end)
+            os.fsync(self._fd)
+            return
+        if ckp_size < clean_end:
+            raise CorruptLogError(
+                "committed prefix is torn and no checkpoint covers it")
+
+        tmp = self._path + ".tmp"
+        with open(self._ckp_path, "rb") as fsrc, open(tmp, "wb") as fdst:
+            self._copy_prefix(fsrc, fdst, clean_end)
+            os.fsync(fdst.fileno())
+        # Windows cannot rename over a path held open by the append fd.
+        os.close(self._fd)
+        try:
+            os.replace(tmp, self._path)
+            _fsync_dir(self._dir)
+        finally:
+            self._fd = os.open(
+                self._path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        if os.fstat(self._fd).st_size != clean_end:
+            raise CorruptLogError("restore did not converge")
+
+    def _converge(self):
+        """Validate and converge the on-disk log to its clean state.
+
+        Returns ``(frames, discarded)`` for the now-clean log. Raises
+        ``CorruptLogError`` without changing anything if the log is corrupt.
+        Safe to run repeatedly and safe to kill at any point.
+
+        The durable commit boundary is the highest of the validated log
+        boundary, the checkpoint boundary and the marker boundary, so it can
+        never regress. A log torn inside its committed prefix is rebuilt from
+        the checkpoint and ``discarded`` stays 0 (those bytes were committed,
+        not an unfinished write); a torn or merely uncommitted tail past the
+        boundary is discarded, and the marker freezes that report until the
+        next commit even when the kill lands mid-repair.
+        """
+        self._remove_stale_temps()
+        marker = self._read_marker()
+        marker_end = -1
+        marker_discarded = 0
+        if marker is not None:
+            marker_end, marker_discarded = marker
+
+        frames, terminal = self._read_log()
+        log_end, _log_seq = self._validate(frames, terminal)
+        ckp_end = self._checkpoint_boundary()
+        size = os.fstat(self._fd).st_size
+
+        target = max(log_end, ckp_end, marker_end)
+        # The target bytes must come from somewhere still on disk: the
+        # validated log itself or the checkpoint.
+        if target > log_end and target > ckp_end:
+            raise CorruptLogError("recovery target has no durable source")
+
+        log_clean = terminal is None and size == log_end
+
+        if log_clean and log_end == target:
+            # Nothing to repair. An old marker whose epoch a newer commit
+            # closed durably can finally go; otherwise its discarded count
+            # stays frozen until that commit.
+            if marker is not None:
+                if target > marker_end:
+                    self._remove_marker()
+                    discarded = 0
+                else:
+                    discarded = marker_discarded
+            else:
+                discarded = 0
+            if ckp_end < target:
+                self._write_checkpoint(target)
+            return frames, discarded
+
+        if target > log_end:
+            # Committed bytes were torn away (offset 0 included): the
+            # checkpoint is the source of truth. The discarded count is only
+            # meaningful when the marker pins this exact boundary.
+            discarded = marker_discarded if target == marker_end else 0
+            self._rebuild_log(target)
+        else:
+            # A dirty suffix sits past the boundary. Decide discarded from
+            # the suffix itself: a torn final record counts, complete
+            # uncommitted frames do not. This also covers a repair killed
+            # before the rebuild (the original suffix is still here, so the
+            # same decision is reached) and fresh writes appended after a
+            # previous repair (a new crash is a new decision rather than the
+            # old marker's). A marker is only frozen once the log itself is
+            # rebuilt clean; see the clean branch above.
+            discarded = 1 if terminal is not None else 0
+            if ckp_end < target:
+                # Make the prefix independently restorable before we publish
+                # the plan or remove any bytes.
+                self._write_checkpoint(target)
+            self._write_marker(target, discarded)
+            self._rebuild_log(target)
+
+        frames, terminal = self._read_log()
+        end, _seq = self._validate(frames, terminal)
+        if end != target or terminal is not None:
+            raise CorruptLogError("restore did not converge")
+        return frames, discarded
+
+    def _publish(self, frames, discarded) -> None:
+        state, _applied = self._replay(frames)
+        self._data = state
+        self._seq = max(
+            (meta["s"] for meta, _v, _s, _e in frames
+             if meta.get("t") == _OP_COMMIT),
+            default=0)
+        self._entries = len(frames)
+        self._pending = 0
+        self._discarded = discarded
+        self._corrupt = False
+
+    def _converge_on_open(self) -> None:
+        """Crash cleanup at open; leave a corrupt store inert for recover()."""
+        try:
+            frames, discarded = self._converge()
         except CorruptLogError:
-            # Keep the corrupt log untouched; recover() will raise it.
             self._corrupt = True
             return
-        self._discarded = discarded
-
-        state, _applied = self._replay(frames, committed_end)
-
-        size = os.fstat(self._fd).st_size
-        if size > committed_end:
-            os.ftruncate(self._fd, committed_end)
-            os.fsync(self._fd)
-
-        self._data = state
-        self._seq = last_seq
-        self._entries = sum(1 for _m, _v, _s, end in frames
-                            if end <= committed_end)
+        self._publish(frames, discarded)
 
     # -- argument validation ----------------------------------------------
 
@@ -344,10 +648,19 @@ class Store:
             return self._seq
         _write_all(self._fd, _encode_frame(_OP_COMMIT, seq=self._seq + 1))
         os.fsync(self._fd)
+
+        # The commit frame is durable first, so even a kill here leaves a
+        # clean log the next open refreshes the checkpoint from. Publish the
+        # new restorable prefix, then close the recovery epoch.
+        clean_end = os.fstat(self._fd).st_size
+        self._write_checkpoint(clean_end)
+        had_marker = os.path.exists(self._marker_path)
         self._seq += 1
         self._pending = 0
-        self._discarded = 0
         self._entries += 1
+        self._discarded = 0
+        if had_marker:
+            self._remove_marker()
         return self._seq
 
     def recover(self) -> dict:
@@ -358,38 +671,32 @@ class Store:
         otherwise) and ``seq`` is the durable sequence number after recovery.
         Raises ``CorruptLogError`` (a ``ValueError``) if the log is corrupt;
         nothing is applied or truncated in that case.
+
+        Recovery is idempotent and kill-safe: interrupting it any number of
+        times and rerunning converges to the same state and the same report
+        as one clean recovery, and the next commit always uses ``seq + 1``.
         """
         self._ensure_open()
         if self._pending:
             raise ValueError(
                 "cannot recover with uncommitted changes in this session")
 
-        frames, terminal = self._read_log()
+        # Re-validate and re-converge; a genuinely corrupt log raises here
+        # before anything is applied or removed.
+        frames, discarded = self._converge()
 
-        # Phase 1: validate the whole log before touching any state.
-        committed_end, last_seq, discarded = \
-            self._validate(frames, terminal)
-        # Open already replays and truncates; keep the torn count it saw so
-        # the report is stable across repeated recover() calls.
-        discarded = max(discarded, self._discarded)
-        self._discarded = discarded
-
-        # Phase 2: replay into a fresh mapping, then publish it.
-        state, applied = self._replay(frames, committed_end)
-
-        size = os.fstat(self._fd).st_size
-        if size > committed_end:
-            os.ftruncate(self._fd, committed_end)
-            os.fsync(self._fd)
-
+        state, applied = self._replay(frames)
+        seq = max(
+            (meta["s"] for meta, _v, _s, _e in frames
+             if meta.get("t") == _OP_COMMIT),
+            default=0)
         self._data = state
-        self._seq = last_seq
+        self._seq = seq
+        self._entries = len(frames)
         self._pending = 0
-        self._entries = sum(1 for _m, _v, _s, end in frames
-                            if end <= committed_end)
+        self._discarded = discarded
         self._corrupt = False
-        return {"applied": applied, "discarded": discarded,
-                "seq": last_seq}
+        return {"applied": applied, "discarded": discarded, "seq": seq}
 
     def stats(self) -> dict:
         self._ensure_open()
