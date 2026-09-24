@@ -7,7 +7,14 @@ import sys
 import tempfile
 import unittest
 
-from wal_store.store import Store, _encode_frame, _OP_COMMIT, _OP_DELETE, _OP_PUT
+from wal_store.store import (
+    Store,
+    CorruptLogError,
+    _encode_frame,
+    _OP_COMMIT,
+    _OP_DELETE,
+    _OP_PUT,
+)
 
 KILLER = r"""
 import sys
@@ -42,11 +49,19 @@ class StoreBase(unittest.TestCase):
 
 
 class BasicOperationsTest(StoreBase):
-    def test_open_creates_directory(self):
+    def test_open_missing_directory_raises_filenotfound(self):
         path = os.path.join(self.dir, "deep", "store")
+        with self.assertRaises(FileNotFoundError):
+            Store(path)
+        self.assertFalse(os.path.exists(path))
+
+    def test_open_existing_empty_directory(self):
+        path = os.path.join(self.dir, "store")
+        os.makedirs(path)
         with Store(path) as s:
             self.assertEqual(s.get("x"), None)
-        self.assertTrue(os.path.isdir(path))
+            self.assertEqual(s.recover(),
+                             {"applied": 0, "discarded": 0, "seq": 0})
         self.assertTrue(os.path.isfile(os.path.join(path, "wal.log")))
 
     def test_open_regular_file_raises_oserror(self):
@@ -67,7 +82,8 @@ class BasicOperationsTest(StoreBase):
         with self.reopen() as s:
             self.assertEqual(s.get("a"), b"1")
             self.assertEqual(s.get("b"), b"two")
-            self.assertEqual(s.recover(), {"applied": 2, "seq": 1})
+            self.assertEqual(s.recover(),
+                             {"applied": 2, "discarded": 0, "seq": 1})
 
     def test_raw_value_bytes_preserved(self):
         value = bytes(range(256)) + b"\x00\xff\nWAL1garbage\n\x00"
@@ -85,7 +101,8 @@ class BasicOperationsTest(StoreBase):
         self.assertEqual(seq, 1)
         with self.reopen() as s:
             self.assertEqual(s.get("k"), b"v")
-            self.assertEqual(s.recover(), {"applied": 2, "seq": 1})
+            self.assertEqual(s.recover(),
+                             {"applied": 2, "discarded": 0, "seq": 1})
 
     def test_delete_committed_key(self):
         with Store(self.dir) as s:
@@ -95,7 +112,8 @@ class BasicOperationsTest(StoreBase):
             s.commit()
         with self.reopen() as s:
             self.assertIsNone(s.get("k"))
-            self.assertEqual(s.recover(), {"applied": 2, "seq": 2})
+            self.assertEqual(s.recover(),
+                             {"applied": 2, "discarded": 0, "seq": 2})
 
     def test_get_missing_returns_none(self):
         with Store(self.dir) as s:
@@ -167,7 +185,8 @@ class ValidationTest(StoreBase):
             # Torn tail is silently dropped at open, already clean now.
             self.assertEqual(s.get("a"), b"1")
             result = s.recover()
-        self.assertEqual(result, {"applied": 1, "seq": 1})
+        self.assertEqual(result,
+                         {"applied": 1, "discarded": 1, "seq": 1})
 
     def test_recover_with_pending_raises(self):
         with Store(self.dir) as s:
@@ -189,7 +208,8 @@ class RecoveryTest(StoreBase):
         with self.reopen() as s:
             self.assertEqual(s.get("a"), b"1")
             self.assertIsNone(s.get("b"))
-            self.assertEqual(s.recover(), {"applied": 1, "seq": 1})
+            self.assertEqual(s.recover(),
+                             {"applied": 1, "discarded": 0, "seq": 1})
 
     def test_hard_kill_loses_only_uncommitted(self):
         code = KILLER % os.path.dirname(os.path.dirname(
@@ -202,7 +222,10 @@ class RecoveryTest(StoreBase):
         with Store(self.dir) as s:
             self.assertEqual(s.get("committed"), b"yes")
             self.assertIsNone(s.get("uncommitted"))
-            self.assertEqual(s.recover(), {"applied": 1, "seq": 1})
+            report = s.recover()
+        self.assertEqual(report["applied"], 1)
+        self.assertEqual(report["seq"], 1)
+        self.assertIn(report["discarded"], (0, 1))
 
     def test_recover_is_idempotent(self):
         with Store(self.dir) as s:
@@ -214,7 +237,8 @@ class RecoveryTest(StoreBase):
             first = s.recover()
             second = s.recover()
             third = s.recover()
-        self.assertEqual(first, {"applied": 3, "seq": 1})
+        self.assertEqual(first,
+                         {"applied": 3, "discarded": 0, "seq": 1})
         self.assertEqual(second, first)
         self.assertEqual(third, first)
 
@@ -245,7 +269,9 @@ class RecoveryTest(StoreBase):
             with self.reopen() as s:
                 self.assertEqual(s.get("a"), b"1")
                 self.assertIsNone(s.get("b"))
-                self.assertEqual(s.recover(), {"applied": 1, "seq": 1})
+                self.assertEqual(
+                    s.recover(),
+                    {"applied": 1, "discarded": 1, "seq": 1})
             # The torn bytes were truncated.
             self.assertEqual(self.log_bytes(), raw)
 
@@ -355,7 +381,8 @@ class RecoveryTest(StoreBase):
             s.delete("a")
             self.assertEqual(s.commit(), 3)
         with self.reopen() as s:
-            self.assertEqual(s.recover(), {"applied": 3, "seq": 3})
+            self.assertEqual(s.recover(),
+                             {"applied": 3, "discarded": 0, "seq": 3})
 
     def test_empty_then_dirty_tail_after_commit(self):
         # Commit, then dirty mutations, then torn bytes at the very end.
@@ -370,8 +397,129 @@ class RecoveryTest(StoreBase):
         with self.reopen() as s:
             self.assertEqual(s.get("a"), b"1")
             self.assertIsNone(s.get("b"))
-            self.assertEqual(s.recover(), {"applied": 1, "seq": 1})
+            self.assertEqual(s.recover(),
+                             {"applied": 1, "discarded": 1, "seq": 1})
         self.assertEqual(self.log_bytes(), raw)
+
+    def test_discarded_stable_across_repeat_recover(self):
+        # The torn count is reported even after open truncated the bytes.
+        with Store(self.dir) as s:
+            s.put("a", b"1")
+            s.commit()
+        raw = self.log_bytes()
+        torn = _encode_frame(_OP_PUT, b"tail", key="b")
+        with open(os.path.join(self.dir, "wal.log"), "wb") as f:
+            f.write(raw + torn[:9])
+        with self.reopen() as s:
+            first = s.recover()
+            second = s.recover()
+        self.assertEqual(first,
+                         {"applied": 1, "discarded": 1, "seq": 1})
+        self.assertEqual(second, first)
+
+    def test_discarded_clears_after_new_commit(self):
+        with Store(self.dir) as s:
+            s.put("a", b"1")
+            s.commit()
+        raw = self.log_bytes()
+        torn = _encode_frame(_OP_PUT, b"tail", key="b")
+        with open(os.path.join(self.dir, "wal.log"), "wb") as f:
+            f.write(raw + torn[:9])
+        with self.reopen() as s:
+            self.assertEqual(s.recover()["discarded"], 1)
+            s.put("c", b"3")
+            self.assertEqual(s.commit(), 2)
+            self.assertEqual(s.recover(),
+                             {"applied": 2, "discarded": 0, "seq": 2})
+
+    def test_torn_record_not_at_end_is_corrupt(self):
+        with Store(self.dir) as s:
+            s.put("a", b"1")
+            s.commit()
+        raw = self.log_bytes()
+        frame = _encode_frame(_OP_PUT, b"middle", key="b")
+        # A short frame followed by a perfectly good frame: the gap is in the
+        # middle of the log, which a hard kill cannot leave, so it is
+        # corruption rather than a discardable tail.
+        tail = _encode_frame(_OP_PUT, b"after", key="c")
+        with open(os.path.join(self.dir, "wal.log"), "wb") as f:
+            f.write(raw + frame[:10] + tail)
+        with self.reopen() as s:
+            with self.assertRaises(CorruptLogError):
+                s.recover()
+            self.assertEqual(s.get("a"), None)
+        # The corrupt log is left exactly as found.
+        self.assertEqual(self.log_bytes(), raw + frame[:10] + tail)
+
+    def test_oversize_length_field_is_corrupt(self):
+        import zlib
+        with Store(self.dir) as s:
+            s.put("a", b"1")
+            s.commit()
+        raw = self.log_bytes()
+        # Intact header (magic, length, valid header crc) declaring a length
+        # beyond the allowed maximum.
+        prefix = b"WAL2" + (1 << 41).to_bytes(8, "big")
+        header = prefix + zlib.crc32(prefix).to_bytes(4, "big")
+        with open(os.path.join(self.dir, "wal.log"), "wb") as f:
+            f.write(raw + header)
+        with self.reopen() as s:
+            with self.assertRaises(CorruptLogError):
+                s.recover()
+
+    def test_unparseable_metadata_is_corrupt(self):
+        # A framed, checksum-valid record whose metadata is not JSON.
+        import zlib
+        payload = b"{not-json\nvalue"
+        prefix = b"WAL2" + len(payload).to_bytes(8, "big")
+        frame = (prefix + zlib.crc32(prefix).to_bytes(4, "big") + payload
+                 + zlib.crc32(payload).to_bytes(4, "big"))
+        with Store(self.dir) as s:
+            s.put("a", b"1")
+            s.commit()
+        raw = self.log_bytes()
+        with open(os.path.join(self.dir, "wal.log"), "wb") as f:
+            f.write(raw + frame)
+        with self.reopen() as s:
+            with self.assertRaises(CorruptLogError):
+                s.recover()
+
+    def test_corrupt_log_error_is_value_error(self):
+        self.assertTrue(issubclass(CorruptLogError, ValueError))
+
+    def test_reopen_seq_continues_and_next_commit_is_plus_one(self):
+        with Store(self.dir) as s:
+            s.put("a", b"1")
+            s.commit()
+            s.put("b", b"2")
+            s.commit()
+        with self.reopen() as s:
+            self.assertEqual(s.stats()["seq"], 2)
+            s.put("c", b"3")
+            self.assertEqual(s.commit(), 3)
+        with self.reopen() as s:
+            self.assertEqual(s.stats()["seq"], 3)
+            self.assertEqual(s.commit(), 3)
+
+    def test_stats_ignore_torn_and_uncommitted_tail(self):
+        with Store(self.dir) as s:
+            s.put("a", b"1")
+            s.commit()
+        log_path = os.path.join(self.dir, "wal.log")
+        clean_bytes = os.path.getsize(log_path)
+        torn = _encode_frame(_OP_PUT, b"tail", key="b")
+        with open(log_path, "rb") as f:
+            raw = f.read()
+        with open(log_path, "wb") as f:
+            f.write(raw + torn[:6])
+        with self.reopen() as before:
+            stats_before = before.stats()
+        with self.reopen() as after:
+            stats_after = after.stats()
+        self.assertEqual(stats_before, stats_after)
+        self.assertEqual(stats_before["seq"], 1)
+        self.assertEqual(stats_before["bytes"], clean_bytes)
+        self.assertEqual(stats_before["entries"], 2)
 
 
 if __name__ == "__main__":

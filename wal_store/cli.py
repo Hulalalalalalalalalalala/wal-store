@@ -6,12 +6,15 @@ Usage::
     python -m wal_store --path DIR put KEY --value-file FILE
     python -m wal_store --path DIR get KEY
 
-Exit codes: 0 success, 1 missing key on get, 2 usage error, 3 storage error.
+Exit codes: 0 success, 1 missing key on get, 2 usage error, 3 storage error
+(including a missing store directory and a corrupt log).
 """
 
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import sys
 from typing import Sequence
 
@@ -56,6 +59,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "put":
             with open(args.value_file, "rb") as f:
                 value = f.read()
+            # Writing initializes a new store; recovery on a missing
+            # directory stays an error handled by Store itself.
+            os.makedirs(args.path, exist_ok=True)
             with Store(args.path) as store:
                 store.put(args.key, value)
                 store.commit()
@@ -64,7 +70,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "recover":
             with Store(args.path) as store:
                 result = store.recover()
-            sys.stdout.write(f"{result['applied']} {result['seq']}\n")
+            # Key order follows the report: applied, discarded, seq.
+            line = json.dumps(result, separators=(",", ":"))
+            sys.stdout.write(line + "\n")
             return 0
     except (ValueError, TypeError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)

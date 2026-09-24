@@ -54,7 +54,8 @@ class CliTest(CliBase):
 
         code, out, err = self.run_cli("--path", self.dir, "recover")
         self.assertEqual(code, 0, err)
-        self.assertEqual(out, "1 1\n")
+        self.assertEqual(out,
+                         '{"applied":1,"discarded":0,"seq":1}\n')
 
     def test_get_writes_raw_bytes_to_binary_stdout(self):
         payload = bytes(range(256))
@@ -110,7 +111,50 @@ class CliTest(CliBase):
     def test_recover_on_fresh_store(self):
         code, out, err = self.run_cli("--path", self.dir, "recover")
         self.assertEqual(code, 0, err)
-        self.assertEqual(out, "0 0\n")
+        self.assertEqual(out, '{"applied":0,"discarded":0,"seq":0}\n')
+
+    def test_recover_missing_directory_exit_3(self):
+        missing = os.path.join(self.dir, "never", "created")
+        code, out, err = self.run_cli("--path", missing, "recover")
+        self.assertEqual(code, 3)
+        self.assertEqual(out, "")
+        self.assertTrue(err.strip())
+        self.assertFalse(os.path.exists(missing))
+
+    def test_recover_corrupt_exit_3_no_json(self):
+        from wal_store.store import Store
+        with Store(self.dir) as s:
+            s.put("a", b"1")
+            s.commit()
+        with open(os.path.join(self.dir, "wal.log"), "r+b") as f:
+            f.seek(-1, os.SEEK_END)
+            f.write(b"\x00")
+        code, out, err = self.run_cli("--path", self.dir, "recover")
+        self.assertEqual(code, 3)
+        self.assertEqual(out, "")
+        self.assertTrue(err.strip())
+
+    def test_recover_torn_tail_exit_0_reports_discarded(self):
+        from wal_store.store import Store, _encode_frame, _OP_PUT
+        with Store(self.dir) as s:
+            s.put("a", b"1")
+            s.commit()
+        with open(os.path.join(self.dir, "wal.log"), "ab") as f:
+            f.write(_encode_frame(_OP_PUT, b"tail", key="b")[:7])
+        code, out, err = self.run_cli("--path", self.dir, "recover")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out, '{"applied":1,"discarded":1,"seq":1}\n')
+
+    def test_put_creates_missing_directory(self):
+        new_dir = os.path.join(self.dir, "created", "by", "put")
+        vf = os.path.join(self.dir, "v.bin")
+        with open(vf, "wb") as f:
+            f.write(b"v")
+        code, _, err = self.run_cli("--path", new_dir, "put", "k",
+                                    "--value-file", vf)
+        self.assertEqual(code, 0, err)
+        self.assertTrue(os.path.isfile(
+            os.path.join(new_dir, "wal.log")))
 
 
 class CliSubprocessTest(CliBase):
@@ -144,7 +188,8 @@ class CliSubprocessTest(CliBase):
         self.module("put", "b", "--value-file", vf)
         r = self.module("recover")
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(r.stdout, b"2 2\n")
+        self.assertEqual(
+            r.stdout, b'{"applied":2,"discarded":0,"seq":2}\n')
 
     def test_module_usage_error_on_stderr(self):
         r = subprocess.run(
