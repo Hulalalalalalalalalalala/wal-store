@@ -48,7 +48,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         if args.command == "get":
-            with Store(args.path) as store:
+            # get is a reader: open read-only so any number of CLI reads can
+            # run beside the single writer without touching the log.
+            with Store(args.path, read_only=True) as store:
                 value = store.get(args.key)
             if value is None:
                 return 1
