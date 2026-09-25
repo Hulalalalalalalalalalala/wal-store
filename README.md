@@ -24,6 +24,9 @@ line subcommand creates it).
 - `put(key, value) -> None` records a mutation.
 - `get(key) -> bytes | None` reads the current value.
 - `delete(key) -> None` records a removal.
+- `delete_range(start=None, end=None) -> None` records a batch removal of
+  every committed key in a half-open byte range (`delete(start, end)` is
+  the same call).
 - `commit() -> int` advances the durable sequence number.
 - `recover() -> dict` replays the log and reports what it applied.
 - `compact() -> dict` rewrites committed history into one tight log and
@@ -54,6 +57,36 @@ takes no lock and keeps no history in memory, so its cost is independent
 of the log's length. A `start` that sorts after `end` raises `ValueError`,
 as does reading from a cursor after `close()` (the cursor is also a
 context manager).
+
+## Range deletes
+
+`delete_range(start=None, end=None)` removes every committed key a scan
+of the same endpoints would return: keys compare by their raw UTF-8
+bytes, the range is half-open (`start` inclusive, `end` exclusive) and a
+`None` endpoint leaves that side unbounded, so `delete_range()` clears
+the whole store while `delete_range("a", "a")` removes nothing. The
+shorthand `delete(start, end)` is the same call; `delete(key)` still
+removes one key. Endpoint validation is shared with `scan`: non-string
+endpoints raise `TypeError` and a `start` sorting after `end` raises
+`ValueError`.
+
+Like every other mutation the tombstone is only staged in the session:
+it is invisible to scans and read-only stores until `commit()`, and a
+writer that is killed first reopens at the last committed state. Once
+committed, the covered keys disappear from single-key reads and scans
+alike, and a key that only ever appears in delete history can never come
+back. Writing a key inside a previously deleted range simply stores the
+new value — after commit it reads back as that last committed value,
+with keys and values still handled as raw bytes.
+
+Recovery resolves a range tombstone by removing the covered keys; the
+report counts the tombstone record under `applied`. Compaction reclaims
+it together with the rest of the dead history: the compacted image
+contains one live put per surviving key and no tombstones at all, so
+reclaiming the record can never resurrect a deleted key, and a snapshot
+scans to the identical bytes before and after compaction.
+
+## Read-only stores
 
 `wal_store.Store(path, read_only=True)` opens an isolated reader. Any
 number of read-only processes may coexist with the single writer in the

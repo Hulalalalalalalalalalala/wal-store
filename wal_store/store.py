@@ -47,6 +47,19 @@ cost of a scan is independent of how long the log's history is. A reversed
 range (``start`` after ``end``) and any read from a closed cursor raise
 ``ValueError``.
 
+Range deletes (``Store.delete_range(start, end)``, or ``delete(start,
+end)``) use the very same endpoints and half-open bytewise convention as
+scans: after the next commit, every key a scan of ``[start, end)`` would
+have returned is gone -- from single-key reads and scans alike -- while a
+``None`` endpoint leaves that side unbounded and a reversed range raises
+``ValueError`` through the shared endpoint check. The tombstone is staged
+like any other mutation: until committed it is invisible to scans and
+readers and a crash discards it. A key written inside a previously
+deleted range simply keeps its new value, and keys that only ever appear
+in delete history never come back -- recovery resolves the tombstone by
+removing the covered keys and compaction drops the record entirely, so no
+deleted key can ever be resurrected.
+
 Read-only processes (``Store(path, read_only=True)``) take no lock and never
 create or modify a file. At open each one picks the highest committed prefix
 available at that instant -- the validated ``wal.log`` prefix or ``wal.ckp``
@@ -97,11 +110,20 @@ so an incomplete record in the middle of the log reads as corruption while
 a genuinely short final header reads as a torn tail.
 
 Metadata is a compact JSON object: ``{"t":"p","k":key}`` for puts,
-``{"t":"d","k":key}`` for deletes, ``{"t":"c","s":seq}`` for ordinary
-commits and ``{"t":"b","s":seq}`` for the base commit that closes a
-compacted log. The two carry the sequence identically; a base marker is
-additionally required to be the first commit marker in its file.
+``{"t":"d","k":key}`` for deletes, ``{"t":"r","s":start,"e":end}`` for
+range tombstones (``null`` marks an unbounded side), ``{"t":"c","s":seq}``
+for ordinary commits and ``{"t":"b","s":seq}`` for the base commit that
+closes a compacted log. The two carry the sequence identically; a base
+marker is additionally required to be the first commit marker in its file.
 The raw value bytes follow the first newline, so values need no encoding.
+
+A range tombstone covers every committed key whose raw UTF-8 bytes sort at
+or after its start and strictly before its end (half-open). It is resolved
+when the log is replayed -- matching keys are popped then -- and, like an
+ordinary delete frame, carries no state of its own. Compaction therefore
+reclaims it together with every other dead record: the live puts the
+compact image contains already exclude each deleted key, so dropping the
+tombstone can never make one reappear.
 """
 
 from __future__ import annotations
@@ -189,6 +211,7 @@ _MAX_PAYLOAD = 1 << 40
 
 _OP_PUT = "p"
 _OP_DELETE = "d"
+_OP_RANGE = "r"
 _OP_COMMIT = "c"
 _OP_BASE = "b"
 _COMMIT_OPS = (_OP_COMMIT, _OP_BASE)
@@ -200,13 +223,55 @@ _COMMIT_OPS = (_OP_COMMIT, _OP_BASE)
 _O_BINARY = getattr(os, "O_BINARY", 0)
 
 
+def _range_bounds_from_meta(meta) -> tuple[bytes | None, bytes | None]:
+    """Decode and validate the two endpoints of a range tombstone frame.
+
+    Returns their raw UTF-8 bytes, ``None`` for a ``null`` (unbounded)
+    side. Missing, mistyped or unencodable endpoints are corruption.
+    """
+    if not isinstance(meta, dict):
+        raise CorruptLogError(f"invalid range tombstone metadata: {meta!r}")
+    if "s" not in meta or "e" not in meta:
+        raise CorruptLogError(
+            f"range tombstone is missing an endpoint: {meta!r}")
+    lo = meta.get("s")
+    hi = meta.get("e")
+    for endpoint in (lo, hi):
+        if endpoint is not None and not isinstance(endpoint, str):
+            raise CorruptLogError(
+                f"invalid range tombstone endpoint: {meta!r}")
+    try:
+        lo_b = lo.encode("utf-8") if lo is not None else None
+        hi_b = hi.encode("utf-8") if hi is not None else None
+    except (UnicodeEncodeError, AttributeError):
+        raise CorruptLogError(
+            f"invalid range tombstone endpoint: {meta!r}")
+    return lo_b, hi_b
+
+
+def _key_in_range(key_bytes: bytes, lo: bytes | None,
+                  hi: bytes | None) -> bool:
+    """Half-open bytewise membership: ``lo <= key < hi``, null unbounded."""
+    if lo is not None and key_bytes < lo:
+        return False
+    if hi is not None and key_bytes >= hi:
+        return False
+    return True
+
+
 def _encode_frame(op: str, value: bytes = b"", key: str | None = None,
-                  seq: int | None = None) -> bytes:
+                  seq: int | None = None, start: str | None = None,
+                  end: str | None = None) -> bytes:
     meta: dict[str, object] = {"t": op}
-    if key is not None:
-        meta["k"] = key
-    if seq is not None:
-        meta["s"] = seq
+    if op == _OP_RANGE:
+        # Both endpoints are always carried; null leaves that side open.
+        meta["s"] = start
+        meta["e"] = end
+    else:
+        if key is not None:
+            meta["k"] = key
+        if seq is not None:
+            meta["s"] = seq
     head = json.dumps(meta, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     payload = head + b"\n" + value
     prefix = _MAGIC + len(payload).to_bytes(8, "big")
@@ -369,7 +434,8 @@ class Store:
     snapshot is independent of the log's later history, so a read never
     replays the log and cannot block the writer, and uncommitted bytes, a
     half-written commit, a torn record or a half-finished rebuild are never
-    visible. ``put``, ``delete``, ``commit``, ``recover`` and ``compact``
+    visible. ``put``, ``delete`` (including its range form),
+    ``delete_range``, ``commit``, ``recover`` and ``compact``
     are rejected on a read-only store; ``stats`` reports the pinned
     snapshot.
 
@@ -470,6 +536,13 @@ class Store:
                 if not isinstance(key, str) or key == "":
                     raise CorruptLogError(
                         f"invalid frame metadata: {meta!r}")
+            elif op == _OP_RANGE:
+                # Both endpoints must be present and be a string or null;
+                # the bounds must not be reversed.
+                lo, hi = _range_bounds_from_meta(meta)
+                if lo is not None and hi is not None and lo > hi:
+                    raise CorruptLogError(
+                        f"range tombstone endpoints out of order: {meta!r}")
             elif op == _OP_BASE:
                 seq = meta.get("s")
                 if not isinstance(seq, int) or isinstance(seq, bool):
@@ -512,6 +585,11 @@ class Store:
                 continue
             if op == _OP_PUT:
                 state[meta["k"]] = value
+            elif op == _OP_RANGE:
+                lo, hi = _range_bounds_from_meta(meta)
+                for key in [k for k in state
+                            if _key_in_range(k.encode("utf-8"), lo, hi)]:
+                    del state[key]
             else:  # _OP_DELETE
                 state.pop(meta["k"], None)
             applied += 1
@@ -1120,6 +1198,25 @@ class Store:
             return self._read_key(key)
         return self._data.get(key)
 
+    @staticmethod
+    def _check_range(start, end):
+        """Validate half-open range endpoints shared by scan and range delete.
+
+        Endpoints are strings (keys compare by their raw UTF-8 bytes) or
+        ``None`` (that side unbounded). A non-string endpoint raises
+        ``TypeError``; a ``start`` sorting after ``end`` raises
+        ``ValueError``. Returns the encoded ``(lo, hi)`` byte bounds.
+        """
+        for endpoint in (start, end):
+            if endpoint is not None and not isinstance(endpoint, str):
+                raise TypeError("range endpoints must be strings or None")
+        lo = start.encode("utf-8") if start is not None else None
+        hi = end.encode("utf-8") if end is not None else None
+        if lo is not None and hi is not None and lo > hi:
+            raise ValueError(
+                f"range start {start!r} sorts after range end {end!r}")
+        return lo, hi
+
     def scan(self, start: str | None = None,
              end: str | None = None) -> ScanCursor:
         """Open an ordered cursor over the pinned committed snapshot.
@@ -1129,10 +1226,11 @@ class Store:
         stored bytes -- covering ``start`` (inclusive) through ``end``
         (exclusive). A ``None`` endpoint leaves that side unbounded, so
         ``scan()`` walks the whole snapshot. Keys that only ever appeared in
-        delete records are absent, a key overwritten any number of times
-        yields only its last committed value, and empty values scan like any
-        other. A writer's uncommitted session changes are not part of the
-        snapshot; a read-only store scans the snapshot it pinned at open.
+        delete records or inside a deleted range are absent, a key
+        overwritten any number of times yields only its last committed
+        value, and empty values scan like any other. A writer's uncommitted
+        session changes are not part of the snapshot; a read-only store
+        scans the snapshot it pinned at open.
 
         The snapshot is materialised once, here, so the cursor is
         independent of later commits, compaction, crash recovery and log
@@ -1141,34 +1239,73 @@ class Store:
         as does reading from the cursor after it is closed.
         """
         self._ensure_open()
-        for endpoint in (start, end):
-            if endpoint is not None and not isinstance(endpoint, str):
-                raise TypeError("scan endpoints must be strings or None")
-        lo = start.encode("utf-8") if start is not None else None
-        hi = end.encode("utf-8") if end is not None else None
-        if lo is not None and hi is not None and lo > hi:
-            raise ValueError(
-                f"scan start {start!r} sorts after scan end {end!r}")
+        lo, hi = self._check_range(start, end)
 
         data = self._ro_index if self._read_only else self._committed_view()
         items = []
         for key, value in data.items():
             key_bytes = key.encode("utf-8")
-            if lo is not None and key_bytes < lo:
-                continue
-            if hi is not None and key_bytes >= hi:
+            if not _key_in_range(key_bytes, lo, hi):
                 continue
             items.append((key_bytes, key, bytes(value)))
         items.sort(key=lambda item: item[0])
         return ScanCursor([(key, value) for _kb, key, value in items])
 
-    def delete(self, key: str) -> None:
+    def delete(self, key: str | None, end: str | None = None) -> None:
+        """Delete one key, or a half-open byte range when ``end`` is given.
+
+        With a single ``key`` this records the removal of that key. With
+        ``end`` it is shorthand for :meth:`delete_range` over
+        ``[key, end)`` -- both entry points share one implementation and
+        one endpoint check; either endpoint may be ``None`` there.
+        """
+        if end is not None:
+            self.delete_range(key, end)
+            return
         self._ensure_writable()
         self._check_key(key)
         _write_all(self._fd, _encode_frame(_OP_DELETE, key=key))
         if key not in self._touched:
             self._touched[key] = self._data.get(key)
         self._data.pop(key, None)
+        self._pending += 1
+        self._entries += 1
+
+    def delete_range(self, start: str | None = None,
+                     end: str | None = None) -> None:
+        """Record a range tombstone deleting every committed key in range.
+
+        Every key whose raw UTF-8 bytes sort at or after ``start`` and
+        strictly before ``end`` is deleted: half-open, bytewise, exactly the
+        range convention of :meth:`scan`. A ``None`` endpoint leaves that
+        side unbounded, so ``delete_range()`` deletes the whole store and
+        ``delete_range("a", "a")`` deletes nothing. Deleting a range, then
+        writing keys inside it, keeps those new values -- the tombstone is
+        fixed to the state before it -- and keys that were deleted are never
+        resurrected by recovery or compaction.
+
+        Like :meth:`delete` the change is staged in this session and becomes
+        durable only at the next :meth:`commit`; until then it is invisible
+        to scans, single-key reads of the committed snapshot and read-only
+        stores, and a crash simply discards it. A ``start`` sorting after
+        ``end`` raises ``ValueError`` (the same check ``scan`` uses) and a
+        non-string endpoint raises ``TypeError``.
+        """
+        self._ensure_writable()
+        lo, hi = self._check_range(start, end)
+
+        _write_all(self._fd, _encode_frame(_OP_RANGE, start=start, end=end))
+
+        # Fold the tombstone into the live session view the same way a
+        # single delete folds its key; each committed key it covers
+        # remembers its pre-session value so a scan can still reconstruct
+        # the untouched committed snapshot before commit.
+        matched = [key for key in list(self._data)
+                   if _key_in_range(key.encode("utf-8"), lo, hi)]
+        for key in matched:
+            if key not in self._touched:
+                self._touched[key] = self._data.get(key)
+            del self._data[key]
         self._pending += 1
         self._entries += 1
 
@@ -1197,10 +1334,11 @@ class Store:
     def recover(self) -> dict:
         """Replay the log and return ``{"applied", "discarded", "seq"}``.
 
-        ``applied`` counts the committed put/delete records replayed,
-        ``discarded`` is 1 when a single torn final record was dropped (0
-        otherwise) and ``seq`` is the durable sequence number after recovery.
-        Raises ``CorruptLogError`` (a ``ValueError``) if the log is corrupt;
+        ``applied`` counts the committed mutation records replayed (puts,
+        deletes and range tombstones), ``discarded`` is 1 when a single
+        torn final record was dropped (0 otherwise) and ``seq`` is the
+        durable sequence number after recovery. Raises
+        ``CorruptLogError`` (a ``ValueError``) if the log is corrupt;
         nothing is applied or truncated in that case.
 
         Recovery is idempotent and kill-safe: interrupting it any number of
