@@ -365,9 +365,9 @@ class CompactionRangeDeleteTest(RangeDeleteBase):
             open(os.path.join(self.dir, "wal.ckp"), "rb").read(), ref_ckp)
         with self.writer() as s:
             self.assertEqual(dict(s.scan()), expected)
-            self.assertEqual(s.commit(), seq)          # empty commit
+            self.assertEqual(s.commit(), seq + 1)      # empty commit advances
             s.put("n", b"n")
-            self.assertEqual(s.commit(), seq + 1)
+            self.assertEqual(s.commit(), seq + 2)
 
     def test_compact_candidate_with_range_frame_is_corrupt(self):
         with self.writer() as s:

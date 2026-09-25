@@ -519,6 +519,52 @@ class FsyncDirPlatformTest(unittest.TestCase):
                             s.recover(),
                             {"applied": 0, "discarded": 0, "seq": 0})
 
+    def test_any_directory_sync_refusal_is_absorbed(self):
+        # The spec fixes this for *any* refusal style: a non-Permission
+        # OSError on the directory open or its fsync must not abort store
+        # creation, commits, checkpoints or compaction, nor later writes.
+        from unittest import mock
+        import stat as statmod
+        real_fsync = os.fsync
+        with tempfile.TemporaryDirectory() as d:
+            store = os.path.join(d, "store")
+            os.makedirs(store)
+
+            def refuse_fsync(fd):
+                try:
+                    if statmod.S_ISDIR(os.fstat(fd).st_mode):
+                        raise OSError(22, "Invalid argument")
+                except OSError:
+                    raise
+                return real_fsync(fd)
+
+            with mock.patch("wal_store.store.os.fsync",
+                            side_effect=refuse_fsync):
+                with Store(store) as s:
+                    self.assertEqual(s.commit(), 1)       # empty commit
+                    s.put("a", b"1")
+                    self.assertEqual(s.commit(), 2)
+                    self.assertEqual(s.compact()["seq"], 2)
+                    self.assertEqual(s.commit(), 3)
+
+            # And a refusal to even open the directory for fsync.
+            store2 = os.path.join(d, "store2")
+            os.makedirs(store2)
+            real_open = os.open
+
+            def refuse_open(path, flags, *a, **k):
+                if path == store2 and not (flags & os.O_WRONLY):
+                    raise OSError(13, "Permission denied")
+                return real_open(path, flags, *a, **k)
+
+            with mock.patch("wal_store.store.os.open",
+                            side_effect=refuse_open):
+                with Store(store2) as s:
+                    s.put("a", b"1")
+                    self.assertEqual(s.commit(), 1)
+            with Store(store2, read_only=True) as r:
+                self.assertEqual(r.get("a"), b"1")
+
 
 if __name__ == "__main__":
     unittest.main()

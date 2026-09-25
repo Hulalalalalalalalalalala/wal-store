@@ -113,12 +113,13 @@ class BasicCompactionTest(CompactBase):
             self.assertEqual(s.get("k00"), b"overwritten")
             self.assertIsNone(s.get("k29"))
             self.assertEqual(s.get("k10"), b"v10")
-            # A no-op commit keeps the sequence; a real commit is seq + 1.
-            self.assertEqual(s.commit(), seq)
-            s.put("new", b"x")
+            # An empty commit advances just like a real one; the next
+            # commit is that value + 1.
             self.assertEqual(s.commit(), seq + 1)
+            s.put("new", b"x")
+            self.assertEqual(s.commit(), seq + 2)
         with Store(self.dir) as s:
-            self.assertEqual(s.stats()["seq"], seq + 1)
+            self.assertEqual(s.stats()["seq"], seq + 2)
             self.assertEqual(s.get("k00"), b"overwritten")
             self.assertIsNone(s.get("k29"))
             self.assertEqual(s.get("new"), b"x")

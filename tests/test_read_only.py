@@ -359,16 +359,17 @@ class ConcurrencyTest(ReadOnlyBase):
             for p in victims:
                 self.assertEqual(p.wait(), -signal.SIGKILL)
             # Writer commits, recovers and reports normally afterwards.
+            # An empty commit still advances the durable sequence.
             with self.writer() as s:
-                self.assertEqual(s.commit(), 1)
-                s.put("k0", b"after-kill")
                 self.assertEqual(s.commit(), 2)
+                s.put("k0", b"after-kill")
+                self.assertEqual(s.commit(), 3)
                 self.assertEqual(
                     s.recover(),
-                    {"applied": 3, "discarded": 0, "seq": 2})
+                    {"applied": 3, "discarded": 0, "seq": 3})
             r = self.reader()
             self.assertEqual(r.get("k0"), b"after-kill")
-            self.assertEqual(r.stats()["seq"], 2)
+            self.assertEqual(r.stats()["seq"], 3)
             r.close()
         finally:
             for p in victims:

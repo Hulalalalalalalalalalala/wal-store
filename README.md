@@ -22,18 +22,24 @@ Python 3.11 or newer. Standard library only.
 exist; opening a missing path raises `FileNotFoundError` (the `put` command
 line subcommand creates it).
 - `put(key, value) -> None` records a mutation.
-- `get(key) -> bytes | None` reads the current value.
+- `get(key) -> bytes | None` reads the value at the last committed snapshot.
 - `delete(key) -> None` records a removal.
 - `delete_range(start=None, end=None) -> None` records a batch removal of
   every committed key in a half-open byte range (`delete(start, end)` is
   the same call).
-- `commit() -> int` advances the durable sequence number.
+- `commit() -> int` advances the durable sequence number. Every call writes
+  a commit marker and advances the sequence by exactly one, including a
+  commit with no pending changes; the first commit after a compaction is the
+  pre-compaction sequence plus one.
 - `recover() -> dict` replays the log and reports what it applied.
 - `compact() -> dict` rewrites committed history into one tight log and
   reclaims the old space, without changing the committed state or the
   durable sequence.
 - `scan(start=None, end=None) -> ScanCursor` opens an ordered read-only
   cursor over the committed snapshot pinned at that moment.
+- `ScanCursor.token() -> bytes` (alias `mark()`) serialises the cursor's
+  current position into a resumable scan token; `scan(token=tok)`
+  (alias `scan(resume=tok)`) continues that scan from the token.
 - `stats() -> dict` reports sequence, entries and bytes.
 
 ## Scanning
@@ -46,8 +52,9 @@ inclusive through `end` exclusive; a `None` endpoint leaves that side
 unbounded, so `scan()` walks everything. Keys that only ever appeared in
 delete records never show up, a key overwritten any number of times yields
 only its last committed value, and empty values scan like any other. A
-writer's uncommitted changes are not part of the snapshot; a read-only
-store scans the snapshot it pinned at open.
+writer's uncommitted changes are not part of the snapshot — they are
+invisible to `scan()` and to `get()` alike, both of which read the last
+committed snapshot; a read-only store scans the snapshot it pinned at open.
 
 The snapshot is materialised once when the cursor opens, so later commits,
 compaction, crash recovery and reclamation of the old log space never
@@ -57,6 +64,53 @@ takes no lock and keeps no history in memory, so its cost is independent
 of the log's length. A `start` that sorts after `end` raises `ValueError`,
 as does reading from a cursor after `close()` (the cursor is also a
 context manager).
+
+## Resumable scans
+
+A scan can be paused and later continued from exactly where it stopped, in
+the same process or after reopening the store (writer or read-only). At any
+point a cursor can serialise its current position into an opaque `bytes`
+token:
+
+- `ScanCursor.token()` returns the token; `mark()` is an alias.
+- `Store.scan(token=tok)` opens a new cursor that continues the identical
+  range from the identical position over the identical snapshot;
+  `scan(resume=tok)` is an alias. The token already carries its range, so
+  passing `start`/`end` together with a token raises `ValueError`.
+
+Splitting one scan at a token and concatenating the pieces yields exactly
+the pairs a single uninterrupted scan would have yielded, byte for byte:
+the resumed stream is the tail of the original scan.
+
+The token names the snapshot it pins — the durable sequence number and a
+content identity over the snapshot's canonical image — together with the
+scan range and the next position. It stays valid across later commits,
+compaction, crash recovery and reclamation of the old log space. When a
+writer mints a token it durably publishes the pinned snapshot as an
+immutable, content-addressed `wal.s<seq>.<id>` sidecar (an atomic write,
+never edited in place), so the token keeps resolving after the underlying
+log bytes are compacted away; snapshots that were never published can also
+be reconstructed from the committed log prefix or the checkpoint. A
+read-only store never creates or modifies a file, even when minting a
+token; such a token still resolves because the writer has published (or can
+reconstruct) that snapshot.
+
+Deleted keys never come back. A token pins one exact committed snapshot:
+resuming it reads precisely that snapshot, whether or not the same keys were
+later deleted, and a range tombstone that compaction has since reclaimed
+neither removes nor revives anything on the resumed path. A fresh scan of a
+snapshot after the delete never shows the key.
+
+A token is opaque and strictly validated. Anything forged, truncated,
+corrupted (checksum mismatch), carrying an out-of-range position, naming a
+reversed range, or referring to a snapshot this store does not hold (a
+foreign store, or a snapshot whose every copy has been reclaimed) raises
+`ValueError`; nothing is guessed or repaired. A non-`bytes` token raises
+`TypeError`. The token format is platform-independent: the same snapshot at
+the same position always mints byte-identical tokens on Windows and Linux
+(all integers are big-endian and no bytes are translated), so tokens can be
+handed across platforms and processes.
+
 
 ## Range deletes
 
@@ -168,8 +222,9 @@ put frame per currently committed key, in sorted key order, followed by a
 base commit marker that carries the pre-compaction sequence. Deleted keys
 are gone for good — a deleted key can never reappear — and overwritten keys
 keep only their final value. The durable sequence number is unchanged, so
-the next `commit()` writes `seq + 1` and subsequent commits continue the
-strict sequence as if no rewrite had happened. The empty committed state
+the next `commit()` writes `seq + 1`; every commit advances, including an
+empty one, and subsequent commits continue the strict sequence as if no
+rewrite had happened. The empty committed state
 (including "everything was deleted") compacts to an empty log.
 
 `compact()` returns the same three-field report shape as `recover()`:
