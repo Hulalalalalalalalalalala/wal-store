@@ -71,6 +71,22 @@ corrupted, out of range or names a snapshot the store does not hold raises
 ``ValueError`` with no guessing or repair; the token bytes are
 platform-independent and identical for the same snapshot and position.
 
+Published snapshot copies are not kept forever: the store reclaims the
+ones nothing references, so the directory does not grow with the number of
+commits. A copy is in use -- and never reclaimed -- while an open cursor
+or a read-only store of the process pins its snapshot; the current
+committed snapshot and the newest three published generations are kept as
+well. After every commit and every compaction (and again when a writer
+opens the store, so a pass killed at any point converges on reopen) every
+other copy is deleted. Reclaiming a copy never invalidates a token by
+itself: the pinned snapshot is still resolved from the remaining copies,
+the committed log prefix or the checkpoint, and the resumed stream does
+not change by a byte. Only when every copy is gone and the log prefix and
+checkpoint can no longer rebuild the snapshot does resuming its token
+raise ``ValueError``. Reclamation touches only redundant copies: in-use
+snapshots are never deleted, and the committed state and the durable
+sequence are unaffected.
+
 Range deletes (``Store.delete_range(start, end)``, or ``delete(start,
 end)``) use the very same endpoints and half-open bytewise convention as
 scans: after the next commit, every key a scan of ``[start, end)`` would
@@ -197,7 +213,7 @@ class ScanCursor:
     """
 
     def __init__(self, items, lo_idx=0, hi_idx=None, pos=None, seq=0,
-                 lo=None, hi=None, publisher=None):
+                 lo=None, hi=None, publisher=None, box=None):
         # ``items`` is the materialised snapshot: (key, value) pairs already
         # sorted by the keys' raw UTF-8 bytes. The visible window is
         # [lo_idx, hi_idx) and the next position starts at ``pos``.
@@ -213,7 +229,10 @@ class ScanCursor:
         # read-only stores, which never create or modify any file.
         self._publisher = publisher
         self._sid = None
-        self._box = None
+        # Keep-alive registration of the pinned snapshot: while the cursor
+        # is open its snapshot counts as in use and its published sidecar
+        # is never reclaimed.
+        self._box = box
         self._closed = False
 
     def __iter__(self) -> "ScanCursor":
@@ -302,6 +321,36 @@ _TOKEN_MAGIC = b"WST1"
 _SNAPSHOT_PREFIX = "wal.s"
 _EMPTY_SNAPSHOT_ID = hashlib.sha256(b"").digest()
 
+# Snapshot sidecar lifecycle. Every published ``wal.s<seq>.<id>`` copy is
+# reclaimable once nothing references it, so the directory does not grow
+# with the number of commits. A copy is never reclaimed while it is in use
+# -- pinned by an open cursor or by a read-only store of this process --
+# and the newest ``_RETAINED_SNAPSHOT_GENERATIONS`` published generations
+# (which always include the current committed snapshot) are kept as well.
+# Reclamation runs after every commit and every compaction, and again when
+# a writer opens the store, so a pass killed at any point is simply
+# finished by the next one and converges to the identical set of files.
+_RETAINED_SNAPSHOT_GENERATIONS = 3
+
+
+def _parse_snapshot_name(name: str):
+    """Parse a ``wal.s<seq>.<id>`` sidecar name into ``(seq, sid)``.
+
+    Returns ``None`` for anything that is not a complete, well-formed
+    sidecar name (including half-published ``.tmp`` files); such files are
+    left alone rather than guessed at.
+    """
+    if not name.startswith(_SNAPSHOT_PREFIX):
+        return None
+    seq_text, dot, sid_hex = name[len(_SNAPSHOT_PREFIX):].partition(".")
+    if not dot or not seq_text.isdigit() or len(sid_hex) != 64:
+        return None
+    try:
+        sid = bytes.fromhex(sid_hex)
+    except ValueError:
+        return None
+    return int(seq_text), sid
+
 
 def _snapshot_image(items) -> bytes:
     """Canonical byte image of a committed snapshot: one put frame per key.
@@ -386,10 +435,11 @@ class _SnapshotBox:
 
 
 # (seq, snapshot id) -> _SnapshotBox, held weakly: an entry lives only
-# while some live cursor or resolver references it, so pinned history
-# never accumulates in memory. It lets a token minted in this process
-# resolve without touching disk; every other path resolves from the
-# durable files.
+# while some live cursor, read-only store or resolver references it, so
+# pinned history never accumulates in memory. It lets a token minted in
+# this process resolve without touching disk, and its live keys are
+# exactly the snapshots reclamation must treat as in use; every other
+# resolution path uses the durable files.
 _SNAPSHOTS: "weakref.WeakValueDictionary" = weakref.WeakValueDictionary()
 
 
@@ -672,6 +722,7 @@ class Store:
             # A read-only open holds no writable fd and never takes a lock;
             # leave the writer fd slot unset for clarity.
             self._fd = -1
+            self._ro_box = None
             self._open_read_only()
             return
 
@@ -1231,6 +1282,10 @@ class Store:
         # before this session commits again (an old-version directory or a
         # reopened store). Best-effort below the write path.
         self._archive_current_snapshot()
+        # Finish any reclamation pass a kill interrupted and drop every
+        # copy that is neither in use nor inside the retention window;
+        # converges to the same set of files no matter where it was killed.
+        self._reclaim_snapshots()
 
     def _converge_on_open(self) -> None:
         """Crash cleanup at open; leave a corrupt store inert for recover()."""
@@ -1262,10 +1317,15 @@ class Store:
         """
         frames, end, seq = self._choose_readonly_prefix()
         state, _applied = self._replay(frames)
-        self._ro_index: dict[str, bytes] = state
+        items = self._sorted_snapshot_items(state)
+        self._ro_index: dict[str, bytes] = dict(items)
         self._ro_seq = seq
         self._ro_entries = len(frames)
         self._ro_bytes = end
+        # The pinned snapshot counts as in use for as long as this reader
+        # is open: a writer's reclamation pass never deletes its sidecar.
+        # Registration is in-memory only; a reader still writes nothing.
+        self._ro_box = _register_snapshot(seq, _snapshot_id(items), items)
 
     def _choose_readonly_prefix(self):
         """Return ``(frames, end, seq)`` for the highest committed snapshot.
@@ -1475,8 +1535,11 @@ class Store:
         seq = self._ro_seq if self._read_only else self._seq
         items = self._sorted_snapshot_items(data)
         lo_idx, hi_idx = self._range_window(items, lo, hi)
+        # Register the pin while the cursor lives: an open cursor's
+        # snapshot counts as in use and its sidecar is never reclaimed.
+        box = _register_snapshot(seq, _snapshot_id(items), items)
         return ScanCursor(items, lo_idx, hi_idx, seq=seq, lo=lo, hi=hi,
-                          publisher=self._snapshot_publisher())
+                          publisher=self._snapshot_publisher(), box=box)
 
     # -- resumable scan tokens ---------------------------------------------
 
@@ -1538,6 +1601,62 @@ class Store:
             return
         self._publish_snapshot(self._seq, None,
                                self._sorted_snapshot_items(self._data))
+
+    def _reclaim_snapshots(self) -> None:
+        """Delete published snapshot sidecars nothing references any more.
+
+        A copy is kept when it is in use -- pinned by an open cursor or a
+        read-only store of this process (the live entries of the process
+        registry) -- when it is the current committed snapshot, or when it
+        is among the newest ``_RETAINED_SNAPSHOT_GENERATIONS`` published
+        generations. Every other ``wal.s*`` sidecar is unlinked. Writer
+        only; a read-only store never creates, modifies or deletes a file.
+
+        Each unlink is atomic and the kept set is a pure function of the
+        durable state and the live pins, so a pass killed at any point is
+        finished by the next one (a later commit, compaction or open) and
+        converges to the identical set of files. A token whose snapshot
+        was reclaimed still resolves while the committed log prefix or the
+        checkpoint can rebuild it; only when every copy is gone does
+        resuming it raise ``ValueError``. Reclamation never touches the
+        log, the checkpoint or the recovery marker, so the committed state
+        and the durable sequence are unaffected, and a failure to unlink
+        one file never fails the operation that triggered the pass -- the
+        file is simply retried by the next pass.
+        """
+        pinned = set(_SNAPSHOTS.keys())
+        if self._seq:
+            items = self._sorted_snapshot_items(self._committed_view())
+            pinned.add((self._seq, _snapshot_id(items)))
+        sidecars = []
+        for name in os.listdir(self._dir):
+            parsed = _parse_snapshot_name(name)
+            if parsed is not None:
+                sidecars.append((parsed, name))
+        # Newest generations first, ties broken by content identity so the
+        # kept set is deterministic. The newest
+        # ``_RETAINED_SNAPSHOT_GENERATIONS`` generations are kept; the
+        # current committed snapshot is always among them (every commit
+        # publishes it and the sequence only advances) and is pinned
+        # explicitly above as well.
+        sidecars.sort(key=lambda entry: entry[0], reverse=True)
+        retained = {key for key, _name
+                    in sidecars[:_RETAINED_SNAPSHOT_GENERATIONS]}
+        removed = False
+        for key, name in sidecars:
+            if key in pinned or key in retained:
+                continue
+            try:
+                os.unlink(os.path.join(self._dir, name))
+                removed = True
+            except FileNotFoundError:
+                pass
+            except OSError:
+                # Best-effort: a copy that cannot go now is retried by the
+                # next pass; reclamation never fails its trigger.
+                pass
+        if removed:
+            _fsync_dir(self._dir)
 
     def _read_snapshot_blob(self, seq: int, sid: bytes):
         """Load and verify a published snapshot sidecar; ``None`` if absent.
@@ -1670,8 +1789,10 @@ class Store:
         lo_idx, hi_idx = self._range_window(items, lo, hi)
         if not lo_idx <= pos <= hi_idx:
             raise ValueError("scan token position is out of range")
+        box = _register_snapshot(seq, sid, items)
         return ScanCursor(items, lo_idx, hi_idx, pos=pos, seq=seq, lo=lo,
-                          hi=hi, publisher=self._snapshot_publisher())
+                          hi=hi, publisher=self._snapshot_publisher(),
+                          box=box)
 
     def delete(self, key: str | None, end: str | None = None) -> None:
         """Delete one key, or a half-open byte range when ``end`` is given.
@@ -1762,6 +1883,9 @@ class Store:
                                self._sorted_snapshot_items(self._data))
         if had_marker:
             self._remove_marker()
+        # Reclaim snapshot copies nothing references any more; killed at
+        # any point the pass is simply finished by the next one.
+        self._reclaim_snapshots()
         return self._seq
 
     def recover(self) -> dict:
@@ -1846,6 +1970,9 @@ class Store:
 
         self._entries = 0 if seq == 0 else live + 1
         self._pending = 0
+        # Same lifecycle pass as after a commit: snapshot copies that fell
+        # out of use and out of the retention window are reclaimed.
+        self._reclaim_snapshots()
         return {"applied": live, "discarded": 0, "seq": seq}
 
     def _write_compact_candidate(self, image: bytes) -> None:
@@ -1877,6 +2004,10 @@ class Store:
             return
         if not self._read_only:
             os.close(self._fd)
+        else:
+            # Release the pinned snapshot: a closed reader no longer counts
+            # as in use for reclamation.
+            self._ro_box = None
         self._closed = True
 
     def __enter__(self) -> "Store":

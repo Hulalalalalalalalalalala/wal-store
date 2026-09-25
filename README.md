@@ -101,6 +101,22 @@ later deleted, and a range tombstone that compaction has since reclaimed
 neither removes nor revives anything on the resumed path. A fresh scan of a
 snapshot after the delete never shows the key.
 
+Published snapshot copies are reclaimed once nothing references them, so
+the store directory does not grow with the number of commits. A copy is in
+use — and is never reclaimed — while an open cursor or a read-only store
+pins its snapshot, and the current committed snapshot together with the
+newest three published generations are always kept. After every commit and
+every compaction the writer deletes every other `wal.s*` copy; the pass is
+a series of independent unlinks, so a process killed anywhere in it simply
+finishes on the next pass (a later commit, compaction or open) and
+converges to the identical set of files, with the committed state and the
+durable sequence untouched. Deleting a copy does not by itself invalidate
+a token: the pinned snapshot is still resolved from a surviving copy, the
+committed log prefix or the checkpoint, and the resumed stream does not
+change by a byte. Only when every copy has been reclaimed and the log
+prefix and checkpoint can no longer rebuild the snapshot does resuming its
+token raise `ValueError`.
+
 A token is opaque and strictly validated. Anything forged, truncated,
 corrupted (checksum mismatch), carrying an out-of-range position, naming a
 reversed range, or referring to a snapshot this store does not hold (a
