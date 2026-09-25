@@ -7,16 +7,20 @@ process:
   lease on open, sharing one short-lived ``wal.lease.*`` sidecar per
   process and directory, and removing it on close (or on garbage
   collection when dropped without ``close()``);
+* a writer's cursors and resume sessions registering leases with the same
+  scope as a reader's, so a cursor that outlives its store still protects
+  its snapshot from a writer in another process;
 * a snapshot pinned by a reader/cursor in *another process* surviving a
   writer's commits, compactions and reopens, then being reclaimed once the
-  holder exits cleanly or is killed and its heartbeat goes stale;
+  holder exits cleanly or is killed and its heartbeat goes stale or its
+  pid is seen gone;
 * the writer re-reading the leases before every unlink and never removing
   a copy a fresh lease names, while a stale, malformed or foreign lease
   neither protects anything nor breaks the sweep;
 * files whose name is not a legal lease sidecar being ignored entirely --
   never parsed, never deleted;
 * a reader in a read-only directory working with no lease and no error;
-* a writer itself never creating a lease sidecar.
+* a writer store itself never creating a lease sidecar.
 """
 
 import base64
@@ -191,6 +195,82 @@ class LeaseFileLifecycleTest(LeaseBase):
         self.assertEqual(_lease_names(self.dir), [])
 
 
+class WriterLeaseTest(LeaseBase):
+    """A writer's cursors and resume sessions lease like a reader's."""
+
+    def test_writer_cursor_registers_and_releases_a_lease(self):
+        with self.writer() as s:
+            s.put("a", b"1")
+            s.commit()
+            # The writer store itself holds no lease...
+            self.assertEqual(_lease_names(self.dir), [])
+            cur = s.scan()
+            next(cur)
+            # ...but its open cursor does, with the reader's scope.
+            self.assertEqual(len(_lease_names(self.dir)), 1)
+            cur.close()
+            self.assertEqual(_lease_names(self.dir), [])
+        self.assertEqual(_lease_names(self.dir), [])
+
+    def test_writer_resume_session_registers_a_lease(self):
+        with self.writer() as s:
+            s.put("a", b"1")
+            s.commit()
+            token = s.scan().token()
+        self.assertEqual(_lease_names(self.dir), [])
+        with self.writer() as s:
+            cur = s.scan(token=token)
+            self.assertEqual(len(_lease_names(self.dir)), 1)
+            self.assertEqual(list(cur), [("a", b"1")])
+            cur.close()
+            self.assertEqual(_lease_names(self.dir), [])
+
+    def test_dropped_writer_cursor_releases_lease_on_gc(self):
+        with self.writer() as s:
+            s.put("a", b"1")
+            s.commit()
+            cur = s.scan()
+            next(cur)
+            self.assertEqual(len(_lease_names(self.dir)), 1)
+            del cur
+            gc.collect()
+            self.assertEqual(_lease_names(self.dir), [])
+
+    def test_writer_cursor_lease_protects_across_processes(self):
+        # A cursor that outlives its writer store still pins its snapshot
+        # for a writer in *another* process -- via the lease sidecar, the
+        # only cross-process channel (the in-process pin set is invisible
+        # to the subprocess).
+        with self.writer() as s:
+            s.put("old", b"o")
+            s.commit()
+        s = self.writer()
+        cur = s.scan()
+        s.close()  # the cursor outlives the store it came from
+        self.assertEqual(len(_lease_names(self.dir)), 1)
+        try:
+            code = (
+                "import sys; sys.path.insert(0, %r);"
+                "from wal_store import Store;"
+                "s = Store(sys.argv[1]);"
+                "[(s.put('k%%02d' %% i, b'v'), s.commit()) for i in range(6)];"
+                "s.close()" % REPO_ROOT)
+            done = subprocess.run([sys.executable, "-c", code, self.dir],
+                                  capture_output=True, timeout=30)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            # Six commits pushed seq 1 far out of the retention window, yet
+            # the leased copy survives and the cursor still serves it.
+            self.assertTrue(self.old_copy_present())
+            self.assertEqual(list(cur), [("old", b"o")])
+        finally:
+            cur.close()
+        self.assertEqual(_lease_names(self.dir), [])
+        # With the lease gone the next sweep reclaims the copy.
+        with self.writer():
+            pass
+        self.assertFalse(self.old_copy_present())
+
+
 class CrossProcessLeaseTest(LeaseBase):
     def test_live_holder_in_other_process_pins_old_copy(self):
         token = self.seed_old_token()
@@ -265,7 +345,12 @@ class CrossProcessLeaseTest(LeaseBase):
 
 
 class LeaseContentTest(LeaseBase):
-    def _write_fake_lease(self, seq, sid, ts, pid=999999, raw=None):
+    def _write_fake_lease(self, seq, sid, ts, pid=None, raw=None):
+        # Default to this (alive) process's pid: with process-exit
+        # detection a lease named by a dead pid expires on sight, so a
+        # lease meant to be *fresh* must name a live process.
+        if pid is None:
+            pid = os.getpid()
         name = "%s%d.%s" % (_LEASE_PREFIX, pid, "ab" * 16)
         path = os.path.join(self.dir, name)
         if raw is None:
@@ -284,6 +369,21 @@ class LeaseContentTest(LeaseBase):
         self._write_fake_lease(1, sid, time.time())
         self.advance_past_retention()
         self.assertTrue(self.old_copy_present())
+
+    def test_fresh_lease_from_dead_process_protects_nothing(self):
+        with self.writer() as s:
+            s.put("old", b"o")
+            s.commit()
+            copy = [n for n in os.listdir(self.dir) if n.startswith("wal.s1.")][0]
+            sid = bytes.fromhex(copy.split(".")[2])
+        # A process that has already exited: its heartbeat can never
+        # refresh again, so its lease expires on sight, TTL or no TTL.
+        p = subprocess.Popen([sys.executable, "-c", "pass"])
+        p.wait()
+        name = self._write_fake_lease(1, sid, time.time(), pid=p.pid)
+        self.advance_past_retention()
+        self.assertFalse(self.old_copy_present())
+        self.assertNotIn(name, os.listdir(self.dir))
 
     def test_stale_foreign_lease_is_swept_and_copy_reclaimed(self):
         with self.writer() as s:

@@ -86,20 +86,31 @@ in the same process share one notion of "in use", and a cursor dropped
 without ``close()`` releases its pin when it is garbage collected.
 
 The in-process pin set cannot see users in other processes, so every
-read-only store, cursor and resume session additionally registers a
-short-lived *lease* -- the one kind of sidecar a reader is allowed to
-write, named ``wal.lease.<pid>.<rand>`` -- listing the snapshots that
-process has in use with a heartbeat. The writer reads all lease sidecars
-before reclaiming a copy (re-reading them immediately before each unlink,
-so a lease taken mid-sweep still protects its copy) and keeps every copy a
-fresh lease names. An orderly close removes the sidecar; a process killed
-without closing simply stops heartbeating, and after the lease TTL its
-sidecar pins nothing and is swept. Each lease sidecar is atomically
-rewritten (temp file, rename) and only its owner ever writes it, so
-registering, expiring and reclaiming -- with a kill at any point, reopened
-in any process -- converge to the same in-use set and the same copy set.
-Lease writes are best-effort, so a genuinely read-only directory simply
-has no lease.
+read-only store, every cursor (on either open form) and every resume
+session additionally registers a short-lived *lease* -- the one kind of
+sidecar a reader is allowed to write, named ``wal.lease.<pid>.<rand>`` --
+listing the snapshots that process has in use with a heartbeat. The writer
+reads all lease sidecars before reclaiming a copy (re-reading them
+immediately before each unlink, so a lease taken mid-sweep still protects
+its copy) and keeps every copy a fresh lease names. An orderly close
+removes the sidecar; a process killed without closing simply stops
+heartbeating, and once its timestamp is older than the TTL -- or its pid
+is observed gone, whichever comes first -- its sidecar pins nothing and
+is swept. Each lease sidecar is atomically rewritten (temp file, rename)
+and only its owner ever writes it, so registering, expiring and
+reclaiming -- with a kill at any point, reopened in any process --
+converge to the same in-use set and the same copy set. Lease writes are
+best-effort, so a genuinely read-only directory simply has no lease.
+
+A published copy is only ever trusted after its content proves its name:
+opening one, choosing one for a resume and judging one for reclamation
+all re-verify the stored image against the content identity the name
+carries. A copy that fails verification is corrupt -- it is never
+served, never guessed at and never repaired; the pinned snapshot is
+rebuilt from the committed log prefix or the checkpoint instead, and the
+corrupt file is removed by the ordinary reclamation sweep. Only when the
+copy, the log prefix and the checkpoint can none of them rebuild the
+snapshot does an old token stop resolving (``ValueError``).
 
 Reclamation deletes only redundant copies, never the log, the checkpoint
 or a record, and changes neither the durable sequence nor the committed
@@ -265,13 +276,14 @@ class ScanCursor:
         # reclamation rules: its box keeps the snapshot's pin alive in the
         # process-wide pin set until ``close()`` (or destruction), so
         # reclamation never removes the copy an open cursor is over. The
-        # content identity is derived lazily on the first token mint.
+        # caller usually passes the identity in; otherwise it is derived
+        # lazily on the first token mint.
         self._box = _register_snapshot(seq, items, sid)
-        # On a read-only store the cursor additionally holds a cross-process
-        # lease for its pinned snapshot (``leases`` is the store's lease
-        # registry), so a writer in another process treats it as in use. The
-        # identity is already known there. A writer cursor passes no lease
-        # registry: its pin is visible to the reclaimer directly in-process.
+        # Every cursor -- on a read-only store or on a writer -- holds a
+        # cross-process lease for its pinned snapshot (``leases`` is the
+        # store's lease registry), so a writer in another process treats
+        # it as in use even after the store it came from has closed. The
+        # identity is already known by the time the cursor opens.
         self._leases = leases
         self._lease_held = False
         self._lease_finalizer = None
@@ -495,8 +507,7 @@ class _SnapshotBox:
     cursor or reader that is garbage collected without an explicit
     ``close()`` releases its pin automatically -- the in-use table can
     neither leak nor outlive the snapshots it protects. The content
-    identity is hashed lazily, so merely opening a scan that never mints a
-    token pays no hashing cost.
+    identity is hashed lazily when the caller does not already know it.
     """
 
     __slots__ = ("seq", "items", "_sid", "__weakref__")
@@ -565,6 +576,47 @@ def _pinned_snapshot(seq: int, sid: bytes):
     return None
 
 
+def _process_alive(pid: int) -> bool:
+    """Best-effort liveness check for the process a lease sidecar names.
+
+    A lease whose owner process is gone expires immediately, without
+    waiting out the heartbeat TTL: a killed holder can never refresh its
+    heartbeat again, so its records pin nothing from this moment on. The
+    check is advisory -- a pid that cannot be queried (permissions,
+    platform limits, pid reuse) is treated as alive and falls back to the
+    ordinary heartbeat expiry.
+    """
+    if pid <= 0:
+        return False
+    if sys.platform == "win32":
+        # os.kill(pid, 0) would *terminate* the process on Windows, so
+        # query its exit code through the Win32 handle API instead.
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        # PROCESS_QUERY_LIMITED_INFORMATION
+        handle = kernel32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return False
+        try:
+            exit_code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(
+                    handle, ctypes.byref(exit_code)):
+                return True
+            return exit_code.value == 259  # STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Owned by another user, but very much alive.
+        return True
+    except OSError:
+        return True
+    return True
+
+
 class _LeaseManager:
     """Cross-process registry of snapshots currently in use.
 
@@ -582,9 +634,12 @@ class _LeaseManager:
     and removing a lease never races another process's lease. An orderly
     ``close()`` deletes the sidecar; a process killed without closing simply
     stops heartbeating, and the writer then ignores every record whose
-    timestamp is older than the TTL and sweeps the stale file. The writer
-    reads *all* lease sidecars before reclaiming a copy, so a snapshot a
-    cursor or a read-only store in any process is serving is never removed.
+    timestamp is older than the TTL and sweeps the stale file. The sidecar
+    name also carries the owner's pid, so a holder that has already exited
+    is expired on sight -- its records pin nothing from that moment,
+    without waiting out the TTL. The writer reads *all* lease sidecars
+    before reclaiming a copy, so a snapshot a cursor or a read-only store
+    in any process is serving is never removed.
 
     A lease is a protection, never a requirement: writes are best-effort, so
     a read-only directory simply has no sidecar and reading is unaffected,
@@ -809,6 +864,12 @@ class _LeaseManager:
         return (bool(sep) and pid.isdigit() and len(rand) == 32
                 and all(c in "0123456789abcdef" for c in rand))
 
+    @staticmethod
+    def _lease_pid(name: str) -> int:
+        """The owner pid a well-named lease sidecar carries in its name."""
+        pid, _sep, _rand = name[len(_LEASE_PREFIX):].partition(".")
+        return int(pid)
+
     def _iter_lease_files(self):
         """Yield ``(name, raw)`` for each well-named lease sidecar.
 
@@ -828,17 +889,29 @@ class _LeaseManager:
             except OSError:
                 continue
 
+    def _iter_live_lease_files(self):
+        """Yield ``(name, raw)`` for sidecars whose owner process is alive.
+
+        A sidecar whose named pid no longer runs belongs to a process that
+        ended without closing: its records are stale no matter how fresh
+        the heartbeat looks, so it is neither consulted nor yielded here.
+        """
+        for name, raw in self._iter_lease_files():
+            if _process_alive(self._lease_pid(name)):
+                yield name, raw
+
     def live_keys(self, now: float | None = None) -> set:
         """The ``(seq, sid)`` pairs with a fresh lease in any process.
 
         Every fresh record in every well-named lease sidecar names an in-use
-        snapshot; stale heartbeats (a killed process) and malformed records
-        are ignored. Reading never mutates the registry.
+        snapshot; stale heartbeats, a dead owner process (a killed holder)
+        and malformed records are ignored. Reading never mutates the
+        registry.
         """
         if now is None:
             now = time.time()
         live: set[tuple[int, bytes]] = set()
-        for _name, raw in self._iter_lease_files():
+        for _name, raw in self._iter_live_lease_files():
             for off in range(0, len(raw), _LEASE_REC_LEN):
                 key = self._parse_record(
                     raw[off:off + _LEASE_REC_LEN], now)
@@ -849,12 +922,13 @@ class _LeaseManager:
     def prune(self, now: float | None = None) -> None:
         """Remove lease sidecars that name no live user.
 
-        A sidecar whose every record is stale or malformed belongs to a
-        process that ended without closing (its heartbeat stopped) and is
-        swept; a sidecar with at least one fresh record is left untouched.
-        Each unlink is independent, so a kill mid-sweep simply finishes on
-        the next reclaim. This process's own sidecar is never pruned while
-        it holds keys.
+        A sidecar whose every record is stale or malformed, or whose owner
+        process is gone, belongs to a process that ended without closing
+        (its heartbeat stopped) and is swept; a sidecar with at least one
+        fresh record from a live process is left untouched. Each unlink is
+        independent, so a kill mid-sweep simply finishes on the next
+        reclaim. This process's own sidecar is never pruned while it holds
+        keys.
         """
         if now is None:
             now = time.time()
@@ -862,12 +936,13 @@ class _LeaseManager:
         for name, raw in list(self._iter_lease_files()):
             if name == self._name:
                 continue
-            fresh = any(
-                self._parse_record(raw[off:off + _LEASE_REC_LEN], now)
-                is not None
-                for off in range(0, len(raw), _LEASE_REC_LEN))
-            if fresh:
-                continue
+            if _process_alive(self._lease_pid(name)):
+                fresh = any(
+                    self._parse_record(raw[off:off + _LEASE_REC_LEN], now)
+                    is not None
+                    for off in range(0, len(raw), _LEASE_REC_LEN))
+                if fresh:
+                    continue
             try:
                 os.unlink(os.path.join(self._dir, name))
                 removed = True
@@ -879,15 +954,16 @@ class _LeaseManager:
             _fsync_dir(self._dir)
 
 
-# Process-wide lease managers, one per store directory. All read-only stores
-# opened on one directory in this process (and their cursors) share a manager
-# and therefore one lease sidecar, so independently closing stores and
-# cursors reference-count the same on-disk records. A manager with no holders
-# keeps neither a thread nor a file; reusing it later merely repopulates one.
-# The map is weak on its values -- every open store on the directory holds a
-# strong reference, so a manager is collected once they are all gone and does
-# not accumulate across a long process -- and a writer borrows the same keyed
-# manager only to scan and prune the cross-process leases.
+# Process-wide lease managers, one per store directory. All stores opened
+# on one directory in this process (and every cursor, on either open form)
+# share a manager and therefore one lease sidecar, so independently closing
+# stores and cursors reference-count the same on-disk records. A manager
+# with no holders keeps neither a thread nor a file; reusing it later
+# merely repopulates one. The map is weak on its values -- every open store
+# on the directory holds a strong reference, so a manager is collected once
+# they are all gone and does not accumulate across a long process -- and a
+# writer borrows the same keyed manager to scan and prune the cross-process
+# leases.
 _LEASES: "weakref.WeakValueDictionary[str, _LeaseManager]" = (
     weakref.WeakValueDictionary())
 _LEASE_ATEXIT = False
@@ -1192,13 +1268,22 @@ class Store:
         # the retention rule itself), so this stays ``None`` on a writer.
         self._pin_box = None
         # Cross-process lease registry for this directory, shared by every
-        # store on it in this process. A read-only store acquires a lease for
-        # its open-time snapshot (and its cursors acquire theirs); a writer
-        # only reads and prunes it and never registers itself.
+        # store on it in this process. A read-only store acquires a lease
+        # for its open-time snapshot, and every cursor and resume session --
+        # on either open form -- acquires one for the snapshot it pins; the
+        # writer store itself never registers one (its current snapshot is
+        # kept by the retention rule) and otherwise only reads and prunes
+        # the registry.
         self._leases = _lease_manager(path)
         # The ``(seq, sid)`` this read-only store itself leases, so close()
         # can release just that reference. ``None`` on a writer.
         self._lease_key = None
+        # Lazily computed content identity of the writer's committed
+        # snapshot, cached as ``(seq, sid)`` so a cursor opening on an
+        # unchanged committed state does not re-hash it. The committed
+        # state at one sequence number is immutable, so the sequence alone
+        # keys the cache.
+        self._sid_cache: tuple[int, bytes] | None = None
         # Committed value of each key this session has touched since the
         # last commit (None when the key was absent); lets a scan pin the
         # committed snapshot without replaying the log.
@@ -2053,16 +2138,36 @@ class Store:
         seq = self._ro_seq if self._read_only else self._seq
         items = self._sorted_snapshot_items(data)
         lo_idx, hi_idx = self._range_window(items, lo, hi)
-        # A read-only cursor rides the store's cross-process lease registry:
-        # it leases its pinned snapshot (the open-time one here, so the
-        # identity is already known) and a writer in any process then keeps
-        # that copy. Writer cursors are visible to the reclaimer in-process
-        # and take no lease.
+        # Every cursor rides the store's cross-process lease registry,
+        # whichever open form it is on: it leases its pinned snapshot (the
+        # reader's open-time one here, so the identity is already known;
+        # the writer's committed one, cached per sequence) and a writer in
+        # any process then keeps that copy -- even after the store this
+        # cursor came from has closed.
+        if self._read_only:
+            sid = self._ro_sid
+        else:
+            sid = self._committed_snapshot_id(seq, items)
         return ScanCursor(
             items, lo_idx, hi_idx, seq=seq, lo=lo, hi=hi,
             publisher=self._snapshot_publisher(),
-            leases=(self._leases if self._read_only else None),
-            sid=(self._ro_sid if self._read_only else None))
+            leases=self._leases, sid=sid)
+
+    def _committed_snapshot_id(self, seq: int, items) -> bytes | None:
+        """Content identity of the writer's committed snapshot at ``seq``.
+
+        Cached per sequence number: the committed state at one sequence is
+        immutable, so repeated scans between commits hash it only once.
+        The empty initial snapshot (sequence 0) has no published copy and
+        needs no lease, so it carries no identity here.
+        """
+        if seq < 1:
+            return None
+        cache = self._sid_cache
+        if cache is None or cache[0] != seq:
+            cache = (seq, _snapshot_id(items))
+            self._sid_cache = cache
+        return cache[1]
 
     # -- resumable scan tokens ---------------------------------------------
 
@@ -2098,9 +2203,12 @@ class Store:
         canonical put frames -- is content-addressed as
         ``wal.s<seq>.<id>`` and atomically replaced, so republishing is a
         no-op and a kill mid-publish leaves only a temp file the next open
-        reclaims. Writer-only: read-only stores never publish snapshot
-        copies (their cross-process pin rides the lease sidecar instead).
-        The empty initial snapshot (sequence 0) needs no file: it is the
+        reclaims. An existing file with the same name is trusted only after
+        its content verifies against the name's identity; a corrupt one is
+        no copy at all and is atomically replaced with the authoritative
+        image. Writer-only: read-only stores never publish snapshot copies
+        (their cross-process pin rides the lease sidecar instead). The
+        empty initial snapshot (sequence 0) needs no file: it is the
         well-known empty content and always reconstructible.
         """
         if seq == 0:
@@ -2108,7 +2216,8 @@ class Store:
         if sid is None:
             sid = _snapshot_id(items)
         path = self._snapshot_blob_path(seq, sid)
-        if os.path.exists(path):
+        if (os.path.exists(path)
+                and self._load_snapshot_copy(seq, sid) is not None):
             return
         blob = _encode_frame(_OP_SNAP, seq=seq) + _snapshot_image(items)
 
@@ -2171,34 +2280,57 @@ class Store:
         deleted -- the log prefix and the checkpoint are untouched -- so
         ongoing reads and resumed scans do not change by a byte.
 
+        Every candidate's content is verified against the identity its
+        name carries before it counts as a copy at all: a file whose
+        content does not match is corrupt -- unusable to every reader --
+        and is removed here like any other dead copy, never served and
+        never repaired. Corrupt files do not occupy a retention slot.
+
         Before removing any single copy every lease is re-read, so a lease
         registered while the sweep runs still protects its copy; stale lease
-        sidecars (a process killed without closing, its heartbeat stopped)
-        are swept first. The scan is idempotent and kill-safe: each unlink
-        is independent, re-running reaches the same set of files, and a run
-        killed at any unlink is simply finished on the next open; malformed
-        sidecar names are ignored rather than treated as files to delete.
+        sidecars (a process killed without closing, its heartbeat stopped
+        or its pid gone) are swept first. The scan is idempotent and
+        kill-safe: each unlink is independent, re-running reaches the same
+        set of files, and a run killed at any unlink is simply finished on
+        the next open; malformed sidecar names are ignored rather than
+        treated as files to delete.
         """
-        copies = []  # (seq, sid, name)
+        copies = []   # usable copies: (seq, sid, name)
+        corrupt = []  # well-named files whose content fails verification
         try:
             names = os.listdir(self._dir)
         except FileNotFoundError:
             return
         for name in names:
             parsed = self._parse_snapshot_name(name)
-            if parsed is not None:
-                copies.append((parsed[0], parsed[1], name))
+            if parsed is None:
+                continue
+            seq, sid = parsed
+            if self._load_snapshot_copy(seq, sid) is not None:
+                copies.append((seq, sid, name))
+            else:
+                corrupt.append(name)
         # Forget lease sidecars whose owner stopped heartbeating before
         # consulting the registry, so a killed process cannot pin a copy
         # past the TTL. Best-effort: a sweep that fails changes nothing.
         self._leases.prune()
+        removed = False
+        # Corrupt copies are dead weight: no reader can ever use them, so
+        # no pin, lease or retention slot protects them.
+        for name in corrupt:
+            try:
+                os.unlink(os.path.join(self._dir, name))
+            except FileNotFoundError:
+                continue
+            except OSError:
+                continue
+            removed = True
         # Retain the current committed snapshot and the three newest
         # generations that precede it; older generations are reclaimed
         # unless a user (in any process) has them open.
         predecessors = sorted({seq for seq, _sid, _n in copies
                                if seq != self._seq}, reverse=True)
         kept_seqs = {self._seq, *predecessors[:_SNAPSHOT_RETENTION]}
-        removed = False
         for seq, sid, name in copies:
             if seq == self._seq or seq in kept_seqs:
                 continue
@@ -2215,43 +2347,46 @@ class Store:
         if removed:
             _fsync_dir(self._dir)
 
-    def _read_snapshot_blob(self, seq: int, sid: bytes):
-        """Load and verify a published snapshot sidecar; ``None`` if absent.
+    def _load_snapshot_copy(self, seq: int, sid: bytes):
+        """Load a published snapshot sidecar if its content proves its name.
 
-        The blob must be a clean frame sequence: one snapshot header with
-        the token's sequence, then put frames with strictly increasing keys
-        whose canonical image hashes to the token's identity. A damaged or
-        mismatched sidecar is corruption of the snapshot machinery, never
-        silently skipped.
+        Returns the sorted items when ``wal.s<seq>.<id>`` exists and
+        verifies -- a clean frame sequence of one snapshot header carrying
+        the name's sequence followed by put frames with strictly increasing
+        keys whose canonical image hashes to the name's content identity.
+        Returns ``None`` when the file is absent, unreadable or fails any
+        check: a copy whose content does not match its content-addressed
+        name is corrupt, and corrupt copies are never served, never guessed
+        at and never repaired. The caller falls back to the committed log
+        prefix or the checkpoint, and the reclamation sweep removes the
+        file.
         """
         path = self._snapshot_blob_path(seq, sid)
         try:
             with open(path, "rb") as f:
                 raw = f.read()
-        except FileNotFoundError:
+        except OSError:
+            # Absent, or unreadable for any reason: not a usable copy.
             return None
-        except OSError as exc:
-            raise CorruptLogError(f"snapshot sidecar is unreadable: {exc}")
         frames, terminal = self._scan_bytes(raw)
         if terminal is not None or not frames:
-            raise CorruptLogError("snapshot sidecar is not a clean image")
+            return None
         head = frames[0][0]
         if head.get("t") != _OP_SNAP or head.get("s") != seq:
-            raise CorruptLogError(
-                "snapshot sidecar does not match its name")
+            return None
         items = []
         last_key = None
         for meta, value, _start, _end in frames[1:]:
             key = meta.get("k")
             if (meta.get("t") != _OP_PUT or not isinstance(key, str)
                     or key == ""):
-                raise CorruptLogError("snapshot sidecar holds a non-put frame")
+                return None
             if last_key is not None and key <= last_key:
-                raise CorruptLogError("snapshot sidecar keys are not sorted")
+                return None
             items.append((key, value))
             last_key = key
         if _snapshot_id(items) != sid:
-            raise CorruptLogError("snapshot sidecar fails its identity check")
+            return None
         return items
 
     def _snapshot_from_logs(self, seq: int, sid: bytes):
@@ -2312,8 +2447,11 @@ class Store:
         Resolution order: the process-wide registry of live snapshots, this
         store's own committed state, the durable ``wal.s`` sidecar a writer
         published when the token was minted, and the committed prefix of
-        the log or checkpoint. The empty initial snapshot (sequence 0) is
-        always reconstructible. Anything else is a forged, stale or foreign
+        the log or checkpoint. A sidecar whose content fails its identity
+        check is corrupt and counts as no copy at all -- the rebuild
+        sources are tried instead, and only when they also fail is the
+        token rejected. The empty initial snapshot (sequence 0) is always
+        reconstructible. Anything else is a forged, stale or foreign
         token and is rejected without guessing.
         """
         items = _pinned_snapshot(seq, sid)
@@ -2326,7 +2464,7 @@ class Store:
             items = self._sorted_snapshot_items(data)
             if _snapshot_id(items) == sid:
                 return items
-        items = self._read_snapshot_blob(seq, sid)
+        items = self._load_snapshot_copy(seq, sid)
         if items is not None:
             return items
         items = self._snapshot_from_logs(seq, sid)
@@ -2349,13 +2487,13 @@ class Store:
         lo_idx, hi_idx = self._range_window(items, lo, hi)
         if not lo_idx <= pos <= hi_idx:
             raise ValueError("scan token position is out of range")
-        # A read-only resume session leases the token's (possibly older)
-        # pinned snapshot so a writer in another process keeps its copy; a
-        # writer resume is protected by its own in-process pin.
+        # A resume session -- on either open form -- leases the token's
+        # (possibly older) pinned snapshot so a writer in another process
+        # keeps its copy; the in-process pin covers the same store's own
+        # reclamation.
         return ScanCursor(items, lo_idx, hi_idx, pos=pos, seq=seq, lo=lo,
                           hi=hi, publisher=self._snapshot_publisher(),
-                          sid=sid,
-                          leases=(self._leases if self._read_only else None))
+                          sid=sid, leases=self._leases)
 
     def delete(self, key: str | None, end: str | None = None) -> None:
         """Delete one key, or a half-open byte range when ``end`` is given.

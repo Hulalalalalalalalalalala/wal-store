@@ -91,6 +91,11 @@ immutable, content-addressed `wal.s<seq>.<id>` sidecar (an atomic write,
 never edited in place), so the token keeps resolving after the underlying
 log bytes are compacted away; snapshots that were never published can also
 be reconstructed from the committed log prefix or the checkpoint. A
+copy is trusted only after its content verifies against the identity its
+name carries: a copy that fails verification is corrupt — it is never
+served, never guessed at and never repaired, the snapshot is rebuilt
+from the committed log prefix or the checkpoint instead, and the corrupt
+file is removed by the ordinary reclamation sweep. A
 read-only store never publishes a snapshot copy when minting a token;
 such a token still resolves because the writer has published (or can
 reconstruct) that snapshot. The reader's only on-disk artifact is the
@@ -132,25 +137,34 @@ so a sweep killed mid-run simply completes on reopen):
   it lists the snapshots that process has in use with a heartbeat, and the
   writer reads every lease before removing a copy (re-reading them
   immediately before each unlink, so a lease taken mid-sweep still
-  protects its copy). An orderly close removes the lease; a process killed
-  without closing stops heartbeating, and after the lease TTL its lease
-  pins nothing and is swept. An in-use token keeps pointing at the same
-  snapshot across commits, compactions and crash recovery; resuming it is
-  byte-for-byte the tail of the original one-shot scan. Reclamation
-  deletes only redundant copies — the reads and resumes in flight do not
-  change by a byte, and a deleted key never comes back.
+  protects its copy). Read-only stores register a lease for the snapshot
+  they pin at open, and every cursor and resumed scan — on a reader or on
+  a writer alike — registers one for the snapshot it serves. An orderly
+  close removes the lease; a process killed without closing stops
+  heartbeating, and once the lease TTL passes or its pid is seen gone —
+  whichever comes first — its lease pins nothing and is swept. An in-use
+  token keeps pointing at the same snapshot across commits, compactions
+  and crash recovery; resuming it is byte-for-byte the tail of the
+  original one-shot scan. Reclamation deletes only redundant copies — the
+  reads and resumes in flight do not change by a byte, and a deleted key
+  never comes back.
 - **Always retained** — the current committed snapshot and the newest
   three published predecessor generations are never reclaimed.
 - **Everything else** — copies outside the retention window with no user
   (no in-process pin and no fresh lease in any process) are deleted.
+  Before any copy counts as retained or usable its content is verified
+  against the identity its name carries; a copy that fails is corrupt,
+  occupies no retention slot and is deleted like any other dead copy.
 
 A copy disappearing does not by itself invalidate a token: the token
 keeps working for as long as that snapshot can still be rebuilt from the
-committed log prefix or the checkpoint. Only once every copy is gone and
-neither the surviving log prefix nor the checkpoint can rebuild the
-snapshot does resuming an old token raise `ValueError`. Forged,
-truncated, corrupted, out-of-range or cross-snapshot tokens raise
-`ValueError` just as before; the store never guesses or repairs them.
+committed log prefix or the checkpoint. A corrupt copy is treated exactly
+like a missing one for that decision — its bytes are never handed to a
+caller. Only once every copy is gone or corrupt and neither the surviving
+log prefix nor the checkpoint can rebuild the snapshot does resuming an
+old token raise `ValueError`. Forged, truncated, corrupted, out-of-range
+or cross-snapshot tokens raise `ValueError` just as before; the store
+never guesses or repairs them.
 
 Reclamation is an idempotent convergence: independent file unlinks with
 a directory sync at the end, so a kill at any point leaves a state the
@@ -204,7 +218,8 @@ checkpoint or a snapshot copy; the only file it creates is its own
 short-lived lease sidecar, registering the snapshots it has in use so a
 writer in another process keeps them (best-effort — a read-only
 directory simply has no lease, and the lease is removed again on close
-or expires by heartbeat if the process is killed). It pins a snapshot at
+or expires by heartbeat or process-exit detection if the process is
+killed). It pins a snapshot at
 open time and every `get` reads from that one complete committed
 snapshot, so uncommitted mutations, a half-written commit, a torn record
 or a half-finished shrink are never visible. Successive reads from the

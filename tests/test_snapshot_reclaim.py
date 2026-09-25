@@ -11,6 +11,10 @@ These tests cover the reclamation rules added on top of resumable scans:
 * a token staying valid after its copy is gone while the snapshot can
   still be rebuilt from the log prefix/checkpoint, and raising
   ``ValueError`` once no source remains;
+* a copy whose content does not match the identity in its name being
+  treated as corrupt: never served (reads and resumes rebuild the
+  snapshot from the committed log prefix or the checkpoint instead),
+  occupying no retention slot, and removed by the ordinary sweep;
 * reclamation converging after a kill mid-sweep, never regressing the
   durable sequence or changing committed state;
 * only genuine ``bytes`` being accepted as a token (``TypeError`` for
@@ -226,6 +230,136 @@ class TokenSurvivalTest(ReclaimBase):
             self.assertEqual(head, ("k2", b"v"))
             self.assertEqual(list(cursor),
                              [("k3", b"v"), ("k4", b"v")])
+
+
+class CorruptCopyTest(ReclaimBase):
+    """Copies whose content does not match the identity in their name.
+
+    A corrupt copy is never served, never guessed at and never repaired:
+    reads and resumes rebuild the pinned snapshot from the committed log
+    prefix or the checkpoint instead, and the reclamation sweep removes
+    the file under the ordinary rules.
+    """
+
+    def copy_name(self, seq):
+        return [n for n in os.listdir(self.dir)
+                if n.startswith("wal.s%d." % seq)][0]
+
+    def corrupt_copy(self, seq):
+        # Flip one byte of the published copy: its framing checksum no
+        # longer validates, so the content cannot prove the name.
+        path = os.path.join(self.dir, self.copy_name(seq))
+        with open(path, "rb") as f:
+            raw = bytearray(f.read())
+        raw[-1] ^= 0xFF
+        with open(path, "wb") as f:
+            f.write(raw)
+
+    def test_corrupt_copy_resume_rebuilds_from_log(self):
+        with self.writer() as s:
+            for i in range(5):
+                s.put("k%d" % i, b"v")
+                s.commit()
+            token = s.scan().token()  # seq 5, copy published
+            s.put("later", b"x")
+            s.commit()  # seq 6: the token's snapshot is no longer current
+        self.corrupt_copy(5)
+        # The corrupt copy is never served; the committed log prefix
+        # rebuilds the identical snapshot, byte for byte.
+        expected = [("k%d" % i, b"v") for i in range(5)]
+        with self.reader() as r:
+            self.assertEqual(list(r.scan(token=token)), expected)
+        with self.writer() as s:
+            self.assertEqual(list(s.scan(token=token)), expected)
+
+    def test_valid_frames_with_wrong_identity_are_corrupt(self):
+        from wal_store.store import _OP_SNAP, _encode_frame, _snapshot_image
+        with self.writer() as s:
+            for i in range(3):
+                s.put("k%d" % i, b"v")
+            s.commit()
+            token = s.scan().token()
+            s.put("later", b"x")
+            s.commit()  # seq 2: the token's snapshot is no longer current
+        # A structurally clean snapshot image whose content does not hash
+        # to the identity the file name carries: still corrupt.
+        path = os.path.join(self.dir, self.copy_name(1))
+        with open(path, "wb") as f:
+            f.write(_encode_frame(_OP_SNAP, seq=1)
+                    + _snapshot_image([("zz", b"q")]))
+        with self.reader() as r:
+            self.assertEqual(list(r.scan(token=token)),
+                             [("k%d" % i, b"v") for i in range(3)])
+
+    def test_corrupt_copy_inside_retention_window_is_reclaimed(self):
+        self.commits(8)
+        self.assertEqual(self.copy_seqs(), {5, 6, 7, 8})
+        self.corrupt_copy(6)
+        with self.writer():
+            pass
+        # The corrupt copy occupies no retention slot and is swept; the
+        # valid generations are untouched.
+        self.assertEqual(self.copy_seqs(), {5, 7, 8})
+
+    def test_corrupt_current_copy_is_republished_on_reopen(self):
+        with self.writer() as s:
+            s.put("a", b"1")
+            s.commit()
+            token = s.scan().token()
+        self.corrupt_copy(1)
+        with self.writer() as s:
+            # The open republishes the authoritative committed image over
+            # the corrupt file, atomically.
+            sid = bytes.fromhex(self.copy_name(1).split(".")[2])
+            self.assertIsNotNone(s._load_snapshot_copy(1, sid))
+        with self.reader() as r:
+            self.assertEqual(list(r.scan(token=token)), [("a", b"1")])
+
+    def test_corrupt_copy_and_no_rebuild_source_raises(self):
+        with self.writer() as s:
+            s.put("gone", b"g")
+            s.commit()
+            token = s.scan().token()  # seq 1
+            s.put("x", b"x")
+            s.commit()  # seq 2: seq 1 is a retained predecessor
+        self.corrupt_copy(1)
+        with self.writer() as s:
+            # The sweep removed the corrupt copy; compaction then reclaims
+            # the log prefix that could have rebuilt the snapshot.
+            self.assertFalse(
+                any(n.startswith("wal.s1.") for n in os.listdir(self.dir)))
+            s.compact()
+        with self.reader() as r:
+            with self.assertRaises(ValueError):
+                r.scan(token=token)
+        with self.writer() as s:
+            with self.assertRaises(ValueError):
+                s.scan(token=token)
+
+    def test_reclaim_of_corrupt_copies_converges_after_kill(self):
+        import shutil
+        self.commits(6)
+        self.corrupt_copy(4)
+        self.corrupt_copy(5)
+        # A kill anywhere in the sweep leaves a state the next open
+        # converges to the identical file set.
+        for _ in range(2):
+            work = os.path.join(self._tmp.name, "crash")
+            shutil.copytree(self.dir, work)
+            proc = subprocess.run(
+                [sys.executable, "-c", KillSafeReclaimTest.CRASH, work, "1"])
+            self.assertIn(proc.returncode, (0, 9))
+            with Store(work) as s:
+                s.put("x", b"x")
+                self.assertEqual(s.commit(), 7)
+            settled = set(os.listdir(work))
+            with Store(work):
+                pass
+            self.assertEqual(set(os.listdir(work)), settled)
+            seqs = {int(n.split(".")[1][1:]) for n in settled
+                    if n.startswith("wal.s")}
+            self.assertEqual(seqs, {3, 6, 7})
+            shutil.rmtree(work)
 
 
 class StrictTokenTypeTest(ReclaimBase):
