@@ -387,10 +387,22 @@ class ReadOnlyNoWritesTest(TokenBase):
             next(cur)
             tok = cur.token()
             self.assertEqual(list(r.scan(token=tok)), [("b", b"b")])
+            # The only file a reader creates is its short-lived lease
+            # sidecar; no snapshot copy or other durable file appears.
+            leases = [n for n in os.listdir(self.dir)
+                      if n.startswith("wal.lease.")]
+            self.assertEqual(len(leases), 1)
+            cur.close()
+        # Once the reader and its cursors are closed the lease is removed and
+        # every pre-existing file is byte-for-byte unchanged.
+        self.assertFalse(
+            [n for n in os.listdir(self.dir) if n.startswith("wal.lease.")])
         self.assertEqual(self.listing(), before)
 
     def test_reader_scan_creates_nothing_on_old_directory(self):
-        # Only wal.log: an old version. A reader must add no wal.s* file.
+        # Only wal.log: an old version. A reader adds no wal.s* snapshot
+        # copy; the single short-lived lease sidecar it registers while open
+        # is removed again on close.
         self.seed(["a"])
         for name in list(os.listdir(self.dir)):
             if name != "wal.log":
@@ -401,6 +413,12 @@ class ReadOnlyNoWritesTest(TokenBase):
             next(cur)
             cur.token()
             list(r.scan())
+            leases = [n for n in os.listdir(self.dir)
+                      if n.startswith("wal.lease.")]
+            self.assertEqual(len(leases), 1)
+            self.assertFalse(
+                [n for n in os.listdir(self.dir) if n.startswith("wal.s")])
+            cur.close()
         self.assertEqual(set(os.listdir(self.dir)), {"wal.log"})
 
 

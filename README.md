@@ -91,9 +91,12 @@ immutable, content-addressed `wal.s<seq>.<id>` sidecar (an atomic write,
 never edited in place), so the token keeps resolving after the underlying
 log bytes are compacted away; snapshots that were never published can also
 be reconstructed from the committed log prefix or the checkpoint. A
-read-only store never creates or modifies a file, even when minting a
-token; such a token still resolves because the writer has published (or can
-reconstruct) that snapshot.
+read-only store never publishes a snapshot copy when minting a token;
+such a token still resolves because the writer has published (or can
+reconstruct) that snapshot. The reader's only on-disk artifact is the
+short-lived lease registered when its store or cursor opened, which keeps
+that snapshot in use across processes for as long as the resumed scan is
+alive.
 
 Deleted keys never come back. A token pins one exact committed snapshot:
 resuming it reads precisely that snapshot, whether or not the same keys were
@@ -122,8 +125,16 @@ every commit and every compaction (and is finished at every writer open,
 so a sweep killed mid-run simply completes on reopen):
 
 - **In use** — a copy is never reclaimed while any open cursor (including
-  one merely iterating, with no token minted) or any live read-only store
-  is serving that snapshot. An in-use token keeps pointing at the same
+  one merely iterating, with no token minted), any live read-only store or
+  any resumed scan is serving that snapshot, in this process or in *any
+  other process*. Cross-process users register a short-lived lease sidecar
+  (`wal.lease.<pid>.<rand>`, the only kind of file a reader ever writes):
+  it lists the snapshots that process has in use with a heartbeat, and the
+  writer reads every lease before removing a copy (re-reading them
+  immediately before each unlink, so a lease taken mid-sweep still
+  protects its copy). An orderly close removes the lease; a process killed
+  without closing stops heartbeating, and after the lease TTL its lease
+  pins nothing and is swept. An in-use token keeps pointing at the same
   snapshot across commits, compactions and crash recovery; resuming it is
   byte-for-byte the tail of the original one-shot scan. Reclamation
   deletes only redundant copies — the reads and resumes in flight do not
@@ -131,7 +142,7 @@ so a sweep killed mid-run simply completes on reopen):
 - **Always retained** — the current committed snapshot and the newest
   three published predecessor generations are never reclaimed.
 - **Everything else** — copies outside the retention window with no user
-  are deleted.
+  (no in-process pin and no fresh lease in any process) are deleted.
 
 A copy disappearing does not by itself invalidate a token: the token
 keeps working for as long as that snapshot can still be rebuilt from the
@@ -144,11 +155,16 @@ truncated, corrupted, out-of-range or cross-snapshot tokens raise
 Reclamation is an idempotent convergence: independent file unlinks with
 a directory sync at the end, so a kill at any point leaves a state the
 next open converges to the identical file set. It cannot delete an
-in-use copy, cannot move the durable sequence or the committed state,
-and never touches `wal.log`, `wal.ckp` or any record; it removes only
-dead `wal.s<seq>.<id>` copies. It adds no command-line subcommand and no
-new files: everything lives in the same store directory behind the
-existing `scan`/token calls.
+in-use copy (one named by an in-process pin or by any fresh lease),
+cannot move the durable sequence or the committed state, and never
+touches `wal.log`, `wal.ckp` or any record; it removes only dead
+`wal.s<seq>.<id>` copies and, once expired, stale `wal.lease.*`
+sidecars. Each lease sidecar is written only by its owner and is
+atomically replaced (never edited in place), so registering, expiring
+and reclaiming converge after a kill in any process to one in-use set
+and one copy set. It adds no command-line subcommand: everything lives
+in the same store directory behind the existing `scan`/token calls, and
+the lease is the one kind of new file — a reader writes nothing else.
 
 
 ## Range deletes
@@ -183,16 +199,22 @@ scans to the identical bytes before and after compaction.
 
 `wal_store.Store(path, read_only=True)` opens an isolated reader. Any
 number of read-only processes may coexist with the single writer in the
-same directory. A reader takes no lock and never creates or changes a
-file; it pins a snapshot at open time and every `get` reads from that one
-complete committed snapshot, so uncommitted mutations, a half-written
-commit, a torn record or a half-finished shrink are never visible.
-Successive reads from the same reader may advance across snapshots only by
-reopening; each read is of one fully committed snapshot. Reads do not
-replay the log and do not block the writer: killing or suspending a reader
-never affects the writer's commits, recovery or stats. `put`, `delete`,
-`commit` and `recover` are rejected on a read-only store; `stats` reports
-the pinned snapshot and `get` is the normal way to read it. Readers serve
+same directory. A reader takes no lock and never touches the log, a
+checkpoint or a snapshot copy; the only file it creates is its own
+short-lived lease sidecar, registering the snapshots it has in use so a
+writer in another process keeps them (best-effort — a read-only
+directory simply has no lease, and the lease is removed again on close
+or expires by heartbeat if the process is killed). It pins a snapshot at
+open time and every `get` reads from that one complete committed
+snapshot, so uncommitted mutations, a half-written commit, a torn record
+or a half-finished shrink are never visible. Successive reads from the
+same reader may advance across snapshots only by reopening; each read is
+of one fully committed snapshot. Reads do not replay the log and do not
+block the writer: killing or suspending a reader never affects the
+writer's commits, recovery or stats (a killed reader leaves only a lease
+that is ignored once stale and then swept). `put`, `delete`, `commit`
+and `recover` are rejected on a read-only store; `stats` reports the
+pinned snapshot and `get` is the normal way to read it. Readers serve
 from the atomically replaced `wal.ckp` sidecar (and the committed log
 prefix), so directories written by older versions open directly.
 

@@ -76,21 +76,39 @@ and position.
 Published snapshot copies have a lifecycle of their own, so the store
 directory does not grow one permanent copy per minted token. Reclamation
 runs after every commit and every compaction and is finished at every
-writer open. A copy survives while it is *in use* -- an open cursor, or a
-live read-only store in this process, is serving that snapshot -- and the
-current committed snapshot together with the newest three published
-predecessor generations are always retained; every other copy is removed.
-The pin set is process-wide and weak, so a writer and the read-only
-stores (or cursors) in the same process share one notion of "in use", and
-a cursor dropped without ``close()`` releases its pin when it is garbage
-collected. Reclamation deletes only redundant copies, never the log, the
-checkpoint or a record, and changes neither the durable sequence nor the
-committed state; the sweep is a set of independent unlinks followed by a
-directory sync, so a kill at any point and a reopen converges to the same
-file set. Losing a copy does not invalidate its token while the snapshot
-can still be rebuilt from the log prefix or the checkpoint; only once no
-copy remains and neither durable source can rebuild it does an old token
-stop resolving (``ValueError``).
+writer open. A copy survives while it is *in use* -- an open cursor, a
+live read-only store, or a resumed scan in this process or *any other
+process*, is serving that snapshot -- and the current committed snapshot
+together with the newest three published predecessor generations are
+always retained; every other copy is removed. The in-process pin set is
+process-wide and weak, so a writer and the read-only stores (or cursors)
+in the same process share one notion of "in use", and a cursor dropped
+without ``close()`` releases its pin when it is garbage collected.
+
+The in-process pin set cannot see users in other processes, so every
+read-only store, cursor and resume session additionally registers a
+short-lived *lease* -- the one kind of sidecar a reader is allowed to
+write, named ``wal.lease.<pid>.<rand>`` -- listing the snapshots that
+process has in use with a heartbeat. The writer reads all lease sidecars
+before reclaiming a copy (re-reading them immediately before each unlink,
+so a lease taken mid-sweep still protects its copy) and keeps every copy a
+fresh lease names. An orderly close removes the sidecar; a process killed
+without closing simply stops heartbeating, and after the lease TTL its
+sidecar pins nothing and is swept. Each lease sidecar is atomically
+rewritten (temp file, rename) and only its owner ever writes it, so
+registering, expiring and reclaiming -- with a kill at any point, reopened
+in any process -- converge to the same in-use set and the same copy set.
+Lease writes are best-effort, so a genuinely read-only directory simply
+has no lease.
+
+Reclamation deletes only redundant copies, never the log, the checkpoint
+or a record, and changes neither the durable sequence nor the committed
+state; the sweep is a set of independent unlinks followed by a directory
+sync, so a kill at any point and a reopen converges to the same file set.
+Losing a copy does not invalidate its token while the snapshot can still
+be rebuilt from the log prefix or the checkpoint; only once no copy
+remains and neither durable source can rebuild it does an old token stop
+resolving (``ValueError``).
 
 
 Range deletes (``Store.delete_range(start, end)``, or ``delete(start,
@@ -107,17 +125,21 @@ removing the covered keys and compaction drops the record entirely, so no
 deleted key can ever be resurrected.
 
 Read-only processes (``Store(path, read_only=True)``) take no lock and never
-create or modify a file. At open each one picks the highest committed prefix
-available at that instant -- the validated ``wal.log`` prefix or ``wal.ckp``
--- scans it once into memory and serves every ``get`` from that index.
-Because the chosen image is complete and is only ever replaced atomically
-(never edited in place), a refresh caught mid-rename, a half-written commit,
-a torn record, or a log being rebuilt, shrunk or compacted can never expose
-partial bytes: each read lands on one full committed snapshot that was
-current at or after the open. A directory written by an older version is
-opened the same way from its log and checkpoint. Reads never replay the log
-afterwards, so their cost is independent of history and they never block
-the writer; a reader that is killed or simply hangs changes nothing on disk.
+touch the log, the checkpoint or any snapshot copy: the only file a reader
+creates is its own short-lived lease sidecar (best-effort, and absent
+altogether in a read-only directory). At open each one picks the highest
+committed prefix available at that instant -- the validated ``wal.log``
+prefix or ``wal.ckp`` -- scans it once into memory and serves every ``get``
+from that index. Because the chosen image is complete and is only ever
+replaced atomically (never edited in place), a refresh caught mid-rename, a
+half-written commit, a torn record, or a log being rebuilt, shrunk or
+compacted can never expose partial bytes: each read lands on one full
+committed snapshot that was current at or after the open. A directory
+written by an older version is opened the same way from its log and
+checkpoint. Reads never replay the log afterwards, so their cost is
+independent of history and they never block the writer; a reader that hangs
+changes no data, and one that is killed merely leaves a lease that expires
+by heartbeat and is swept, never affecting the committed state.
 
 Compaction (``Store.compact()``) rewrites the committed history into one
 tight image without losing a byte of committed state. The compacted log
@@ -174,12 +196,16 @@ tombstone can never make one reappear.
 
 from __future__ import annotations
 
+import atexit
 import bisect
 import hashlib
 import io
 import json
 import os
 import sys
+import threading
+import time
+import uuid
 import weakref
 import zlib
 
@@ -219,7 +245,7 @@ class ScanCursor:
     """
 
     def __init__(self, items, lo_idx=0, hi_idx=None, pos=None, seq=0,
-                 lo=None, hi=None, publisher=None, sid=None):
+                 lo=None, hi=None, publisher=None, sid=None, leases=None):
         # ``items`` is the materialised snapshot: (key, value) pairs already
         # sorted by the keys' raw UTF-8 bytes. The visible window is
         # [lo_idx, hi_idx) and the next position starts at ``pos``.
@@ -241,6 +267,23 @@ class ScanCursor:
         # reclamation never removes the copy an open cursor is over. The
         # content identity is derived lazily on the first token mint.
         self._box = _register_snapshot(seq, items, sid)
+        # On a read-only store the cursor additionally holds a cross-process
+        # lease for its pinned snapshot (``leases`` is the store's lease
+        # registry), so a writer in another process treats it as in use. The
+        # identity is already known there. A writer cursor passes no lease
+        # registry: its pin is visible to the reclaimer directly in-process.
+        self._leases = leases
+        self._lease_held = False
+        self._lease_finalizer = None
+        # Only a snapshot that actually has a published copy (seq >= 1) can
+        # need cross-process protection.
+        if leases is not None and sid is not None and seq >= 1:
+            leases.acquire(seq, sid)
+            self._lease_held = True
+            # A cursor dropped without close() must release its lease the way
+            # its weak in-process pin releases on GC.
+            self._lease_finalizer = weakref.finalize(
+                self, _release_lease, leases, seq, sid)
         self._closed = False
 
     def __iter__(self) -> "ScanCursor":
@@ -269,7 +312,9 @@ class ScanCursor:
         snapshot at the same position always mints the same token. On a
         writer store minting also publishes the pinned snapshot as an
         immutable sidecar so the token survives compaction and reclamation
-        of the old log space; a read-only store never writes anything.
+        of the old log space; a read-only store never publishes a snapshot
+        copy when minting (it only holds the cross-process lease registered
+        when the cursor opened).
         """
         if self._closed:
             raise ValueError("scan cursor is closed")
@@ -295,6 +340,12 @@ class ScanCursor:
         if self._closed:
             return
         _unpin_snapshot(self._box)
+        if self._lease_held:
+            # Detach the GC finalizer: this explicit release is the one.
+            if self._lease_finalizer is not None:
+                self._lease_finalizer.detach()
+            self._leases.release(self._seq, self._sid)
+            self._lease_held = False
         self._items = []
         self._box = None
         self._closed = True
@@ -337,6 +388,29 @@ _EMPTY_SNAPSHOT_ID = hashlib.sha256(b"").digest()
 # many published snapshot copies are always retained; older copies are
 # reclaimed once nothing is using them.
 _SNAPSHOT_RETENTION = 3
+
+# Cross-process in-use registration. The in-process pin set only names users
+# in the opening process, so a snapshot pinned by a cursor or a read-only
+# store in *another* process would look free to this writer's reclamation.
+# Each lease-holding process therefore owns one short-lived sidecar of the
+# single ``wal.lease.*`` kind: it lists the snapshots that process has in use
+# together with a heartbeat timestamp, and is atomically rewritten in place.
+# The writer reads every lease sidecar before removing a copy and treats
+# every fresh one as an in-use pin. An orderly close removes the file; a
+# process killed without closing stops heartbeating, so once its timestamp
+# is older than the TTL it pins nothing and its stale sidecar is swept.
+_LEASE_PREFIX = "wal.lease."
+_LEASE_REC_PREFIX = "wal.l"
+_LEASE_HEARTBEAT = 0.5
+_LEASE_TTL = 5.0
+_LEASE_SID_HEX = 64
+_LEASE_SEQ_MAX = 20
+_LEASE_TS_LEN = 16
+# "wal.l<seq20>.<sid64>.<ts16>\n" -- one fixed-width record per pinned
+# snapshot. A sidecar is always one or more whole records because it is
+# published only by a temp-file/rename, so a reader can never see a torn one.
+_LEASE_REC_LEN = (len(_LEASE_REC_PREFIX) + _LEASE_SEQ_MAX + 1
+                  + _LEASE_SID_HEX + 1 + _LEASE_TS_LEN + 1)
 
 
 def _snapshot_image(items) -> bytes:
@@ -460,6 +534,20 @@ def _unpin_snapshot(box: _SnapshotBox) -> None:
     _PINS.discard(box)
 
 
+def _release_lease(leases, seq: int, sid: bytes) -> None:
+    """Release a GC'd cursor's cross-process lease; never raises.
+
+    A cursor dropped without ``close()`` releases its in-process pin through
+    the weak pin set; this gives the same treatment to its cross-process
+    lease so a forgotten cursor cannot pin a copy forever.
+    """
+    try:
+        leases.release(seq, sid)
+    except Exception:
+        # Finalizers must never raise into the garbage collector.
+        pass
+
+
 def _live_snapshot_keys() -> set:
     """The ``(seq, sid)`` pairs with at least one user in this process."""
     return {(box.seq, box.sid()) for box in _PINS}
@@ -475,6 +563,367 @@ def _pinned_snapshot(seq: int, sid: bytes):
         if box.seq == seq and box.sid() == sid:
             return box.items
     return None
+
+
+class _LeaseManager:
+    """Cross-process registry of snapshots currently in use.
+
+    A process that opens a read-only store or holds a cursor over some
+    snapshot owns exactly one lease sidecar --
+    ``wal.lease.<pid>.<rand>``, all of the single ``wal.lease.*`` kind --
+    listing every snapshot that process has in use, one fixed-width
+    ``wal.l<seq>.<sid>.<heartbeat>\\n`` record each. The file is rewritten
+    atomically (temp file, rename; no fsync, because a lease need not
+    survive a crash) on every change and every heartbeat, so another
+    process never observes a half-written record: what it reads is one
+    complete lease image or the previous one.
+
+    Because each process writes only its own file, registering, refreshing
+    and removing a lease never races another process's lease. An orderly
+    ``close()`` deletes the sidecar; a process killed without closing simply
+    stops heartbeating, and the writer then ignores every record whose
+    timestamp is older than the TTL and sweeps the stale file. The writer
+    reads *all* lease sidecars before reclaiming a copy, so a snapshot a
+    cursor or a read-only store in any process is serving is never removed.
+
+    A lease is a protection, never a requirement: writes are best-effort, so
+    a read-only directory simply has no sidecar and reading is unaffected,
+    while the in-process pins still apply.
+    """
+
+    def __init__(self, directory: str):
+        self._dir = directory
+        # A unique name per process instance. The random suffix keeps two
+        # incarnations of one pid (pid reuse, or processes sharing a copied
+        # directory) from ever touching one sidecar.
+        self._name = f"{_LEASE_PREFIX}{os.getpid()}.{uuid.uuid4().hex}"
+        self._path = os.path.join(directory, self._name)
+        # Snapshot keys this process currently leases, reference counted: a
+        # read-only store and each of its cursors pin independently, so one
+        # key stays registered until every holder has released it.
+        self._counts: dict[tuple[int, bytes], int] = {}
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = None
+        self._disabled = False
+
+    def __del__(self) -> None:
+        # Defensive backstop: if a manager is collected while it still lists
+        # keys (its holders' explicit releases and finalizers normally clear
+        # these first), drop the sidecar. The daemon heartbeat thread, while
+        # alive, holds a reference to this manager, so by here it has exited.
+        try:
+            if getattr(self, "_counts", None):
+                self._remove_locked()
+                self._stop.set()
+        except Exception:
+            pass
+
+    # -- record format -----------------------------------------------------
+
+    @staticmethod
+    def _record(seq: int, sid: bytes, now: float) -> bytes:
+        # Microseconds since the epoch as a fixed 16-digit integer: exactly
+        # 16 digits for every realistic date (no variable-width decimal
+        # point), so every record is one constant width on every platform.
+        ts = str(int(now * 1_000_000)).rjust(_LEASE_TS_LEN, "0")[-_LEASE_TS_LEN:]
+        return (f"{_LEASE_REC_PREFIX}{seq:0{_LEASE_SEQ_MAX}d}."
+                f"{sid.hex()}.").encode("ascii") + ts.encode("ascii") + b"\n"
+
+    def _image(self, now: float) -> bytes:
+        return b"".join(self._record(seq, sid, now)
+                        for seq, sid in sorted(self._counts))
+
+    def _publish(self, now: float | None = None) -> None:
+        """Atomically write this process's current lease image.
+
+        Temp file plus a rename, deliberately *without* fsync: a lease only
+        has to be visible to a concurrently running writer, never to survive
+        a crash -- a crashed owner's lease is treated as stale regardless,
+        and a machine crash leaves no live owner at all. Skipping the fsync
+        (and the directory sync) keeps a read-only open and each heartbeat
+        cheap, while the rename still guarantees the writer reads either the
+        previous complete image or the new one, never a torn file.
+        """
+        if self._disabled:
+            return
+        if now is None:
+            now = time.time()
+        tmp = self._path + ".tmp"
+        try:
+            with open(tmp, "wb") as f:
+                f.write(self._image(now))
+            os.replace(tmp, self._path)
+        except OSError:
+            # A read-only directory can never host a lease: stop trying so a
+            # reader there stays free of repeated failing writes. Any other
+            # OSError (e.g. a brief Windows rename collision with a concurrent
+            # reader of the file) is transient -- leave the lease enabled and
+            # let the next heartbeat republish it, so a live holder is never
+            # mistaken for a dead one.
+            if not os.access(self._dir, os.W_OK):
+                self._disabled = True
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+    # -- lease lifecycle ---------------------------------------------------
+
+    def acquire(self, seq: int, sid: bytes) -> None:
+        """Take one reference on the lease for ``(seq, sid)``.
+
+        Idempotent across the holders of one process (a read-only store and
+        each of its cursors): the key is registered once on disk but stays
+        until every holder has released it.
+        """
+        if sid is None or seq < 1:
+            # The empty initial snapshot (seq 0) never has a published copy
+            # and so never needs a lease.
+            return
+        key = (seq, sid)
+        with self._lock:
+            count = self._counts.get(key, 0) + 1
+            self._counts[key] = count
+            if count == 1:
+                self._publish()
+                self._start_locked()
+
+    def release(self, seq: int, sid: bytes) -> None:
+        """Drop one holder's reference; remove the lease at zero. Best effort."""
+        if sid is None or seq < 1:
+            return
+        key = (seq, sid)
+        thread = None
+        with self._lock:
+            count = self._counts.get(key, 0)
+            if count == 0:
+                return
+            if count > 1:
+                self._counts[key] = count - 1
+                self._publish()
+                return
+            del self._counts[key]
+            if self._counts:
+                self._publish()
+            else:
+                self._remove_locked()
+                thread = self._thread
+                self._stop.set()
+                self._thread = None
+        # Join without holding the lock: a heartbeat already past its wait
+        # may need the lock for one last publish before observing the stop.
+        self._join_thread(thread)
+
+    def close(self) -> None:
+        """Retire every lease this manager's holders still hold."""
+        with self._lock:
+            self._remove_locked()
+            self._counts.clear()
+            thread = self._thread
+            self._stop.set()
+            self._thread = None
+        if thread is not None:
+            self._join_thread(thread)
+
+    def _join_thread(self, thread=None) -> None:
+        if thread is None:
+            return
+        if thread is not threading.current_thread():
+            thread.join(timeout=_LEASE_HEARTBEAT * 4)
+
+    def _remove_locked(self) -> None:
+        if self._disabled:
+            return
+        try:
+            os.unlink(self._path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            # Left behind only if unwritable: it will expire by heartbeat.
+            pass
+
+    # -- heartbeat ---------------------------------------------------------
+
+    def _start_locked(self) -> None:
+        if self._thread is not None or self._disabled:
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._run, name="wal-lease-heartbeat", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop.wait(_LEASE_HEARTBEAT):
+            with self._lock:
+                if self._counts:
+                    self._publish()
+
+    # -- writer-side scan --------------------------------------------------
+
+    @staticmethod
+    def _parse_record(rec: bytes, now: float):
+        """Return ``(seq, sid)`` for a fresh record, else ``None``.
+
+        Malformed bytes, a bad sequence/identity field or a stale heartbeat
+        all mean "no live user". Every sidecar is published whole, so the
+        records parsed are always complete ones -- never a torn read.
+        """
+        if len(rec) != _LEASE_REC_LEN or not rec.endswith(b"\n"):
+            return None
+        try:
+            text = rec.decode("ascii")
+        except UnicodeDecodeError:
+            return None
+        if not text.startswith(_LEASE_REC_PREFIX):
+            return None
+        # Fixed-width layout after "wal.l": seq(20) "." sid(64) "." ts(16).
+        body = text[len(_LEASE_REC_PREFIX):]
+        seq_field = body[:_LEASE_SEQ_MAX]
+        dot1 = body[_LEASE_SEQ_MAX:_LEASE_SEQ_MAX + 1]
+        sid_field = body[_LEASE_SEQ_MAX + 1:_LEASE_SEQ_MAX + 1 + _LEASE_SID_HEX]
+        dot2 = body[_LEASE_SEQ_MAX + 1 + _LEASE_SID_HEX:
+                    _LEASE_SEQ_MAX + 2 + _LEASE_SID_HEX]
+        ts_field = body[_LEASE_SEQ_MAX + 2 + _LEASE_SID_HEX:
+                        _LEASE_SEQ_MAX + 2 + _LEASE_SID_HEX + _LEASE_TS_LEN]
+        if dot1 != "." or dot2 != ".":
+            return None
+        try:
+            seq = int(seq_field)
+            sid = bytes.fromhex(sid_field)
+            micros = int(ts_field)
+        except ValueError:
+            return None
+        if len(sid) != 32 or seq < 1:
+            return None
+        if now - micros / 1_000_000 > _LEASE_TTL:
+            return None
+        return seq, sid
+
+    @staticmethod
+    def _is_lease_name(name: str) -> bool:
+        """Recognise the exact ``wal.lease.<pid>.<32-hex>`` sidecar shape."""
+        if not name.startswith(_LEASE_PREFIX):
+            return False
+        pid, sep, rand = name[len(_LEASE_PREFIX):].partition(".")
+        return (bool(sep) and pid.isdigit() and len(rand) == 32
+                and all(c in "0123456789abcdef" for c in rand))
+
+    def _iter_lease_files(self):
+        """Yield ``(name, raw)`` for each well-named lease sidecar.
+
+        Only names of the exact lease shape are opened; anything else in the
+        directory is ignored -- never parsed, never deleted.
+        """
+        try:
+            names = os.listdir(self._dir)
+        except OSError:
+            return
+        for name in names:
+            if not self._is_lease_name(name):
+                continue
+            try:
+                with open(os.path.join(self._dir, name), "rb") as f:
+                    yield name, f.read()
+            except OSError:
+                continue
+
+    def live_keys(self, now: float | None = None) -> set:
+        """The ``(seq, sid)`` pairs with a fresh lease in any process.
+
+        Every fresh record in every well-named lease sidecar names an in-use
+        snapshot; stale heartbeats (a killed process) and malformed records
+        are ignored. Reading never mutates the registry.
+        """
+        if now is None:
+            now = time.time()
+        live: set[tuple[int, bytes]] = set()
+        for _name, raw in self._iter_lease_files():
+            for off in range(0, len(raw), _LEASE_REC_LEN):
+                key = self._parse_record(
+                    raw[off:off + _LEASE_REC_LEN], now)
+                if key is not None:
+                    live.add(key)
+        return live
+
+    def prune(self, now: float | None = None) -> None:
+        """Remove lease sidecars that name no live user.
+
+        A sidecar whose every record is stale or malformed belongs to a
+        process that ended without closing (its heartbeat stopped) and is
+        swept; a sidecar with at least one fresh record is left untouched.
+        Each unlink is independent, so a kill mid-sweep simply finishes on
+        the next reclaim. This process's own sidecar is never pruned while
+        it holds keys.
+        """
+        if now is None:
+            now = time.time()
+        removed = False
+        for name, raw in list(self._iter_lease_files()):
+            if name == self._name:
+                continue
+            fresh = any(
+                self._parse_record(raw[off:off + _LEASE_REC_LEN], now)
+                is not None
+                for off in range(0, len(raw), _LEASE_REC_LEN))
+            if fresh:
+                continue
+            try:
+                os.unlink(os.path.join(self._dir, name))
+                removed = True
+            except FileNotFoundError:
+                pass
+            except OSError:
+                continue
+        if removed:
+            _fsync_dir(self._dir)
+
+
+# Process-wide lease managers, one per store directory. All read-only stores
+# opened on one directory in this process (and their cursors) share a manager
+# and therefore one lease sidecar, so independently closing stores and
+# cursors reference-count the same on-disk records. A manager with no holders
+# keeps neither a thread nor a file; reusing it later merely repopulates one.
+# The map is weak on its values -- every open store on the directory holds a
+# strong reference, so a manager is collected once they are all gone and does
+# not accumulate across a long process -- and a writer borrows the same keyed
+# manager only to scan and prune the cross-process leases.
+_LEASES: "weakref.WeakValueDictionary[str, _LeaseManager]" = (
+    weakref.WeakValueDictionary())
+_LEASE_ATEXIT = False
+
+
+def _close_all_leases() -> None:
+    """Interpreter-exit backstop: remove every lease this process held.
+
+    A reader that exits normally without an explicit ``close()`` (a common
+    short script) reaches here rather than a SIGKILL, so its sidecar is
+    cleaned up instead of waiting out the TTL. Hard kills still expire by
+    heartbeat.
+    """
+    try:
+        managers = list(_LEASES.values())
+    except Exception:
+        return
+    for manager in managers:
+        try:
+            manager.close()
+        except Exception:
+            pass
+
+
+def _lease_manager(directory: str) -> _LeaseManager:
+    global _LEASE_ATEXIT
+    key = os.path.abspath(directory)
+    manager = _LEASES.get(key)
+    if manager is None:
+        manager = _LeaseManager(key)
+        _LEASES[key] = manager
+        if not _LEASE_ATEXIT:
+            atexit.register(_close_all_leases)
+            _LEASE_ATEXIT = True
+    return manager
+
 
 # os.open defaults to the C runtime's text mode on Windows, which would
 # expand every "\n" to "\r\n" inside os.write and inflate the log on disk.
@@ -686,12 +1135,15 @@ class Store:
     ``FileNotFoundError`` and opening a path that is not a directory raises
     ``OSError``.
 
-    With ``read_only=True`` the store is opened purely for reading. No file
-    is ever created or modified, and no lock is taken: any number of
-    read-only processes may coexist with the one writer. The reader pins the
-    committed snapshot current at open time -- the highest committed prefix
-    of ``wal.log`` or of the atomically replaced ``wal.ckp`` sidecar --
-    scans it once, and serves every ``get`` from that in-memory index. The
+    With ``read_only=True`` the store is opened purely for reading. No log,
+    checkpoint or snapshot file is ever created or modified, and no lock is
+    taken: any number of read-only processes may coexist with the one
+    writer. The one file a reader does create is its own short-lived lease
+    sidecar registering its pinned snapshots cross-process (best-effort; a
+    read-only directory simply has none). The reader pins the committed
+    snapshot current at open time -- the highest committed prefix of
+    ``wal.log`` or of the atomically replaced ``wal.ckp`` sidecar -- scans
+    it once, and serves every ``get`` from that in-memory index. The
     snapshot is independent of the log's later history, so a read never
     replays the log and cannot block the writer, and uncommitted bytes, a
     half-written commit, a torn record or a half-finished rebuild are never
@@ -739,6 +1191,14 @@ class Store:
         # pin table; writers do not pin (the current snapshot is retained by
         # the retention rule itself), so this stays ``None`` on a writer.
         self._pin_box = None
+        # Cross-process lease registry for this directory, shared by every
+        # store on it in this process. A read-only store acquires a lease for
+        # its open-time snapshot (and its cursors acquire theirs); a writer
+        # only reads and prunes it and never registers itself.
+        self._leases = _lease_manager(path)
+        # The ``(seq, sid)`` this read-only store itself leases, so close()
+        # can release just that reference. ``None`` on a writer.
+        self._lease_key = None
         # Committed value of each key this session has touched since the
         # last commit (None when the key was absent); lets a scan pin the
         # committed snapshot without replaying the log.
@@ -974,6 +1434,25 @@ class Store:
                     and name.endswith(".tmp")):
                 try:
                     os.unlink(os.path.join(self._dir, name))
+                except OSError:
+                    pass
+        # Half-published *lease* sidecars are removed only when they are
+        # older than the lease TTL: a fresh ``.tmp`` is a reader's in-flight
+        # atomic heartbeat publish and must not be touched, whereas one left
+        # by a kill is stale by seconds and can never be renamed again.
+        now = time.time()
+        for name in os.listdir(self._dir):
+            if not (name.startswith(_LEASE_PREFIX)
+                    and name.endswith(".tmp")):
+                continue
+            full = os.path.join(self._dir, name)
+            try:
+                age = now - os.stat(full).st_mtime
+            except OSError:
+                continue
+            if age > _LEASE_TTL:
+                try:
+                    os.unlink(full)
                 except OSError:
                     pass
 
@@ -1326,15 +1805,17 @@ class Store:
     # -- read-only opens --------------------------------------------------
 
     def _open_read_only(self) -> None:
-        """Pin a committed snapshot without creating or modifying anything.
+        """Pin a committed snapshot and register its cross-process lease.
 
-        No lock is taken and nothing on disk is written. The reader chooses
-        the highest committed prefix available at the instant it opens --
-        the validated prefix of ``wal.log`` or the existing ``wal.ckp``
-        sidecar, which the writer replaces atomically as part of every
-        commit -- scans that prefix once into memory, and serves every
-        ``get`` from that index. Later reads are independent of log history,
-        never replay the log and never block the writer.
+        No lock is taken and the log, checkpoint and snapshot copies are
+        never touched; the one file written is this reader's short-lived
+        lease sidecar (best-effort). The reader chooses the highest
+        committed prefix available at the instant it opens -- the validated
+        prefix of ``wal.log`` or the existing ``wal.ckp`` sidecar, which the
+        writer replaces atomically as part of every commit -- scans that
+        prefix once into memory, and serves every ``get`` from that index.
+        Later reads are independent of log history, never replay the log
+        and never block the writer.
 
         The checkpoint is a complete, self-contained image that is never
         modified in place (only atomically replaced), so reading it cannot
@@ -1348,11 +1829,21 @@ class Store:
         self._ro_seq = seq
         self._ro_entries = len(frames)
         self._ro_bytes = end
+        items = self._sorted_snapshot_items(state)
+        self._ro_sid = _snapshot_id(items)
         # A live reader counts as a user of the snapshot it pinned: its box
         # stays in the process-wide pin set until the reader closes, so the
         # writer's reclamation never removes that snapshot's copy.
-        self._pin_box = _register_snapshot(
-            seq, self._sorted_snapshot_items(state))
+        self._pin_box = _register_snapshot(seq, items, self._ro_sid)
+        # Make the same pin visible to a writer in another process: register
+        # a short-lived cross-process lease for the open-time snapshot. The
+        # write is best-effort, so a read-only directory simply skips it.
+        self._lease_key = (seq, self._ro_sid)
+        self._leases.acquire(seq, self._ro_sid)
+        # A reader dropped without close() must release its lease the way its
+        # in-process pin releases when it is collected.
+        self._lease_finalizer = weakref.finalize(
+            self, _release_lease, self._leases, seq, self._ro_sid)
 
     def _choose_readonly_prefix(self):
         """Return ``(frames, end, seq)`` for the highest committed snapshot.
@@ -1562,8 +2053,16 @@ class Store:
         seq = self._ro_seq if self._read_only else self._seq
         items = self._sorted_snapshot_items(data)
         lo_idx, hi_idx = self._range_window(items, lo, hi)
-        return ScanCursor(items, lo_idx, hi_idx, seq=seq, lo=lo, hi=hi,
-                          publisher=self._snapshot_publisher())
+        # A read-only cursor rides the store's cross-process lease registry:
+        # it leases its pinned snapshot (the open-time one here, so the
+        # identity is already known) and a writer in any process then keeps
+        # that copy. Writer cursors are visible to the reclaimer in-process
+        # and take no lease.
+        return ScanCursor(
+            items, lo_idx, hi_idx, seq=seq, lo=lo, hi=hi,
+            publisher=self._snapshot_publisher(),
+            leases=(self._leases if self._read_only else None),
+            sid=(self._ro_sid if self._read_only else None))
 
     # -- resumable scan tokens ---------------------------------------------
 
@@ -1599,8 +2098,9 @@ class Store:
         canonical put frames -- is content-addressed as
         ``wal.s<seq>.<id>`` and atomically replaced, so republishing is a
         no-op and a kill mid-publish leaves only a temp file the next open
-        reclaims. Writer-only: read-only stores never create files. The
-        empty initial snapshot (sequence 0) needs no file: it is the
+        reclaims. Writer-only: read-only stores never publish snapshot
+        copies (their cross-process pin rides the lease sidecar instead).
+        The empty initial snapshot (sequence 0) needs no file: it is the
         well-known empty content and always reconstructible.
         """
         if seq == 0:
@@ -1645,21 +2145,39 @@ class Store:
             return None
         return seq, sid
 
+    def _in_use_keys(self) -> set:
+        """Snapshots in use anywhere: this process plus every lease.
+
+        The union of the process-wide weak pin set (open cursors and live
+        readers in this process) and the fresh cross-process lease records
+        (cursors, read-only stores and resume sessions in any other
+        process). The lease files are re-read on every call, so a lease a
+        reader takes during a reclaim sweep is observed before the copy it
+        protects is removed.
+        """
+        return _live_snapshot_keys() | self._leases.live_keys()
+
     def _reclaim_snapshots(self) -> None:
         """Reclaim published snapshot copies that are neither used nor kept.
 
         A copy is kept when it is the current committed snapshot, when it
         belongs to the newest ``_SNAPSHOT_RETENTION`` generations with a
-        published copy, or when it is in use: an open cursor or a live
-        read-only store in this process pins it. Every other
+        published copy, or when it is in use: an open cursor, a live
+        read-only store or a resume session in this process or in *any*
+        process. Cross-process users publish short-lived
+        ``wal.lease.*`` sidecars that are scanned here; a copy named by a
+        fresh, unexpired lease is never removed. Every other
         ``wal.s<seq>.<id>`` sidecar is removed. Only redundant copies are
         deleted -- the log prefix and the checkpoint are untouched -- so
         ongoing reads and resumed scans do not change by a byte.
 
-        The scan is idempotent and kill-safe: each unlink is independent,
-        re-running reaches the same set of files, and a run killed at any
-        unlink is simply finished on the next open; malformed sidecar names
-        are ignored rather than treated as files to delete.
+        Before removing any single copy every lease is re-read, so a lease
+        registered while the sweep runs still protects its copy; stale lease
+        sidecars (a process killed without closing, its heartbeat stopped)
+        are swept first. The scan is idempotent and kill-safe: each unlink
+        is independent, re-running reaches the same set of files, and a run
+        killed at any unlink is simply finished on the next open; malformed
+        sidecar names are ignored rather than treated as files to delete.
         """
         copies = []  # (seq, sid, name)
         try:
@@ -1670,16 +2188,24 @@ class Store:
             parsed = self._parse_snapshot_name(name)
             if parsed is not None:
                 copies.append((parsed[0], parsed[1], name))
+        # Forget lease sidecars whose owner stopped heartbeating before
+        # consulting the registry, so a killed process cannot pin a copy
+        # past the TTL. Best-effort: a sweep that fails changes nothing.
+        self._leases.prune()
         # Retain the current committed snapshot and the three newest
         # generations that precede it; older generations are reclaimed
-        # unless a user in this process has them open.
+        # unless a user (in any process) has them open.
         predecessors = sorted({seq for seq, _sid, _n in copies
                                if seq != self._seq}, reverse=True)
         kept_seqs = {self._seq, *predecessors[:_SNAPSHOT_RETENTION]}
-        live = _live_snapshot_keys()
         removed = False
         for seq, sid, name in copies:
-            if seq == self._seq or seq in kept_seqs or (seq, sid) in live:
+            if seq == self._seq or seq in kept_seqs:
+                continue
+            # Re-scan every cross-process lease immediately before this
+            # unlink: an unexpired lease -- including one acquired after the
+            # sweep began -- keeps the copy, however briefly the window.
+            if (seq, sid) in self._in_use_keys():
                 continue
             try:
                 os.unlink(os.path.join(self._dir, name))
@@ -1823,9 +2349,13 @@ class Store:
         lo_idx, hi_idx = self._range_window(items, lo, hi)
         if not lo_idx <= pos <= hi_idx:
             raise ValueError("scan token position is out of range")
+        # A read-only resume session leases the token's (possibly older)
+        # pinned snapshot so a writer in another process keeps its copy; a
+        # writer resume is protected by its own in-process pin.
         return ScanCursor(items, lo_idx, hi_idx, pos=pos, seq=seq, lo=lo,
                           hi=hi, publisher=self._snapshot_publisher(),
-                          sid=sid)
+                          sid=sid,
+                          leases=(self._leases if self._read_only else None))
 
     def delete(self, key: str | None, end: str | None = None) -> None:
         """Delete one key, or a half-open byte range when ``end`` is given.
@@ -2042,9 +2572,18 @@ class Store:
     def close(self) -> None:
         if self._closed:
             return
-        if self._read_only and self._pin_box is not None:
-            _unpin_snapshot(self._pin_box)
-            self._pin_box = None
+        if self._read_only:
+            if self._pin_box is not None:
+                _unpin_snapshot(self._pin_box)
+                self._pin_box = None
+            # Release just this reader's cross-process reference; a cursor
+            # still open keeps its own reference (and the sidecar) alive.
+            finalizer = getattr(self, "_lease_finalizer", None)
+            if finalizer is not None:
+                finalizer.detach()
+            if self._lease_key is not None:
+                self._leases.release(*self._lease_key)
+                self._lease_key = None
         if not self._read_only:
             os.close(self._fd)
         self._closed = True
