@@ -33,6 +33,17 @@ make the convergence protocol kill-safe and its report stable:
     stable across reopens and repeated recoveries. It is removed by the next
     successful commit.
 
+Range deletes (``Store.delete_range(start, end)``) remove every key in the
+half-open bytewise range ``[start, end)`` with a single tombstone record,
+using the same endpoint validation as scans (``None`` leaves that side
+unbounded, a reversed range raises ``ValueError``). The tombstone is one
+ordinary log record, so it is atomic with its commit: uncommitted range
+deletes are invisible to scans and read-only opens, and a kill before the
+commit leaves exactly the last committed state. Tombstones apply in log
+order -- a key re-put after the tombstone lives, a key only ever deleted
+never comes back -- and compaction reclaims them together with the deleted
+keys' history, so a snapshot scans byte-identically before and after.
+
 Range scans (``Store.scan(start, end)``) open an ordered read-only cursor
 over the complete committed snapshot pinned at the moment the cursor is
 opened. The cursor yields ``(key, value)`` pairs in bytewise key order --
@@ -97,11 +108,13 @@ so an incomplete record in the middle of the log reads as corruption while
 a genuinely short final header reads as a torn tail.
 
 Metadata is a compact JSON object: ``{"t":"p","k":key}`` for puts,
-``{"t":"d","k":key}`` for deletes, ``{"t":"c","s":seq}`` for ordinary
-commits and ``{"t":"b","s":seq}`` for the base commit that closes a
-compacted log. The two carry the sequence identically; a base marker is
-additionally required to be the first commit marker in its file.
-The raw value bytes follow the first newline, so values need no encoding.
+``{"t":"d","k":key}`` for deletes, ``{"t":"r","k":start,"e":end}`` for
+range deletes (either endpoint omitted when unbounded),
+``{"t":"c","s":seq}`` for ordinary commits and ``{"t":"b","s":seq}`` for
+the base commit that closes a compacted log. The two carry the sequence
+identically; a base marker is additionally required to be the first commit
+marker in its file. The raw value bytes follow the first newline, so
+values need no encoding.
 """
 
 from __future__ import annotations
@@ -189,6 +202,7 @@ _MAX_PAYLOAD = 1 << 40
 
 _OP_PUT = "p"
 _OP_DELETE = "d"
+_OP_RANGE = "r"
 _OP_COMMIT = "c"
 _OP_BASE = "b"
 _COMMIT_OPS = (_OP_COMMIT, _OP_BASE)
@@ -201,10 +215,12 @@ _O_BINARY = getattr(os, "O_BINARY", 0)
 
 
 def _encode_frame(op: str, value: bytes = b"", key: str | None = None,
-                  seq: int | None = None) -> bytes:
+                  seq: int | None = None, end: str | None = None) -> bytes:
     meta: dict[str, object] = {"t": op}
     if key is not None:
         meta["k"] = key
+    if end is not None:
+        meta["e"] = end
     if seq is not None:
         meta["s"] = seq
     head = json.dumps(meta, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
@@ -369,9 +385,9 @@ class Store:
     snapshot is independent of the log's later history, so a read never
     replays the log and cannot block the writer, and uncommitted bytes, a
     half-written commit, a torn record or a half-finished rebuild are never
-    visible. ``put``, ``delete``, ``commit``, ``recover`` and ``compact``
-    are rejected on a read-only store; ``stats`` reports the pinned
-    snapshot.
+    visible. ``put``, ``delete``, ``delete_range``, ``commit``, ``recover``
+    and ``compact`` are rejected on a read-only store; ``stats`` reports
+    the pinned snapshot.
 
     ``scan(start, end)`` -- on either open form -- returns a
     :class:`ScanCursor` over the complete committed snapshot pinned at the
@@ -381,6 +397,13 @@ class Store:
     writer are not part of the snapshot. The cursor reads from memory only:
     it never touches the log, takes no lock, and is unaffected by later
     commits, compaction, recovery or the store closing.
+
+    ``delete_range(start, end)`` -- writer form only -- deletes every key
+    in the half-open bytewise range ``[start, end)`` with one tombstone
+    record, sharing the scan endpoint validation (``None`` unbounded, a
+    reversed range raises ``ValueError``). The deletion takes durable
+    effect at the next ``commit``; compaction later reclaims the expired
+    tombstone without any deleted key ever reappearing.
     """
 
     def __init__(self, path: str, read_only: bool = False):
@@ -470,6 +493,17 @@ class Store:
                 if not isinstance(key, str) or key == "":
                     raise CorruptLogError(
                         f"invalid frame metadata: {meta!r}")
+            elif op == _OP_RANGE:
+                lo = meta.get("k")
+                hi = meta.get("e")
+                for endpoint in (lo, hi):
+                    if endpoint is not None and not isinstance(endpoint, str):
+                        raise CorruptLogError(
+                            f"invalid frame metadata: {meta!r}")
+                if (lo is not None and hi is not None
+                        and lo.encode("utf-8") > hi.encode("utf-8")):
+                    raise CorruptLogError(
+                        f"invalid frame metadata: {meta!r}")
             elif op == _OP_BASE:
                 seq = meta.get("s")
                 if not isinstance(seq, int) or isinstance(seq, bool):
@@ -512,8 +546,20 @@ class Store:
                 continue
             if op == _OP_PUT:
                 state[meta["k"]] = value
-            else:  # _OP_DELETE
+            elif op == _OP_DELETE:
                 state.pop(meta["k"], None)
+            else:  # _OP_RANGE: drop every live key in [k, e)
+                lo = meta.get("k")
+                hi = meta.get("e")
+                lo_b = lo.encode("utf-8") if lo is not None else None
+                hi_b = hi.encode("utf-8") if hi is not None else None
+                for key in list(state):
+                    key_b = key.encode("utf-8")
+                    if lo_b is not None and key_b < lo_b:
+                        continue
+                    if hi_b is not None and key_b >= hi_b:
+                        continue
+                    del state[key]
             applied += 1
         return state, applied
 
@@ -1087,6 +1133,24 @@ class Store:
         if key == "":
             raise ValueError("key must not be empty")
 
+    @staticmethod
+    def _range_bounds(start, end, what: str):
+        """Validate range endpoints and return their UTF-8 byte bounds.
+
+        Shared by scans and range deletes: endpoints are strings or
+        ``None`` (an unbounded side), and a start that sorts after the end
+        in bytewise order raises ``ValueError``.
+        """
+        for endpoint in (start, end):
+            if endpoint is not None and not isinstance(endpoint, str):
+                raise TypeError(f"{what} endpoints must be strings or None")
+        lo = start.encode("utf-8") if start is not None else None
+        hi = end.encode("utf-8") if end is not None else None
+        if lo is not None and hi is not None and lo > hi:
+            raise ValueError(
+                f"{what} start {start!r} sorts after {what} end {end!r}")
+        return lo, hi
+
     def _ensure_open(self) -> None:
         if self._closed:
             raise ValueError("store is closed")
@@ -1141,14 +1205,7 @@ class Store:
         as does reading from the cursor after it is closed.
         """
         self._ensure_open()
-        for endpoint in (start, end):
-            if endpoint is not None and not isinstance(endpoint, str):
-                raise TypeError("scan endpoints must be strings or None")
-        lo = start.encode("utf-8") if start is not None else None
-        hi = end.encode("utf-8") if end is not None else None
-        if lo is not None and hi is not None and lo > hi:
-            raise ValueError(
-                f"scan start {start!r} sorts after scan end {end!r}")
+        lo, hi = self._range_bounds(start, end, "scan")
 
         data = self._ro_index if self._read_only else self._committed_view()
         items = []
@@ -1169,6 +1226,41 @@ class Store:
         if key not in self._touched:
             self._touched[key] = self._data.get(key)
         self._data.pop(key, None)
+        self._pending += 1
+        self._entries += 1
+
+    def delete_range(self, start: str | None = None,
+                     end: str | None = None) -> None:
+        """Delete every key in the half-open range ``[start, end)``.
+
+        Records one tombstone covering all keys whose raw UTF-8 bytes sort
+        from ``start`` (inclusive) to ``end`` (exclusive); a ``None``
+        endpoint leaves that side unbounded, so ``delete_range()`` removes
+        everything. The endpoints are validated exactly as for
+        :meth:`scan`: they must be strings or ``None``, and a ``start``
+        that sorts after ``end`` raises ``ValueError``.
+
+        The tombstone is a single log record, durable only with the next
+        :meth:`commit`: until then it is invisible to scans and read-only
+        opens, and a kill before the commit leaves exactly the last
+        committed state. It applies in log order, so a key re-put after
+        the tombstone (in this or a later transaction) lives, while a key
+        the tombstone removed never comes back -- including after
+        compaction, which reclaims the expired tombstone together with the
+        deleted keys' history.
+        """
+        self._ensure_writable()
+        lo, hi = self._range_bounds(start, end, "delete_range")
+        _write_all(self._fd, _encode_frame(_OP_RANGE, key=start, end=end))
+        for key in list(self._data):
+            key_b = key.encode("utf-8")
+            if lo is not None and key_b < lo:
+                continue
+            if hi is not None and key_b >= hi:
+                continue
+            if key not in self._touched:
+                self._touched[key] = self._data.get(key)
+            del self._data[key]
         self._pending += 1
         self._entries += 1
 
@@ -1197,9 +1289,10 @@ class Store:
     def recover(self) -> dict:
         """Replay the log and return ``{"applied", "discarded", "seq"}``.
 
-        ``applied`` counts the committed put/delete records replayed,
-        ``discarded`` is 1 when a single torn final record was dropped (0
-        otherwise) and ``seq`` is the durable sequence number after recovery.
+        ``applied`` counts the committed put/delete/range-delete records
+        replayed, ``discarded`` is 1 when a single torn final record was
+        dropped (0 otherwise) and ``seq`` is the durable sequence number
+        after recovery.
         Raises ``CorruptLogError`` (a ``ValueError``) if the log is corrupt;
         nothing is applied or truncated in that case.
 

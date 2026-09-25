@@ -24,6 +24,9 @@ line subcommand creates it).
 - `put(key, value) -> None` records a mutation.
 - `get(key) -> bytes | None` reads the current value.
 - `delete(key) -> None` records a removal.
+- `delete_range(start=None, end=None) -> None` records a tombstone
+  removing every key in the half-open bytewise range `[start, end)`; a
+  `None` endpoint leaves that side unbounded.
 - `commit() -> int` advances the durable sequence number.
 - `recover() -> dict` replays the log and reports what it applied.
 - `compact() -> dict` rewrites committed history into one tight log and
@@ -55,6 +58,27 @@ of the log's length. A `start` that sorts after `end` raises `ValueError`,
 as does reading from a cursor after `close()` (the cursor is also a
 context manager).
 
+## Range deletes
+
+`delete_range(start, end)` removes every key whose raw UTF-8 bytes sort
+from `start` (inclusive) to `end` (exclusive) — the same half-open,
+bytewise range and the same endpoint validation as `scan()`: a `None`
+endpoint leaves that side unbounded (so `delete_range()` deletes
+everything) and a reversed range raises `ValueError`. The deletion is a
+single tombstone record in the log and takes durable effect only at the
+next `commit()`: an uncommitted range delete is invisible to scans and
+read-only opens, and a writer killed before committing reopens to exactly
+the last committed state.
+
+Tombstones apply in log order. A key re-put after the tombstone lives and
+reads back as its last committed value; a key the tombstone removed never
+comes back — not after recovery, and not after compaction, which reclaims
+the expired tombstone together with the deleted keys' history. A snapshot
+scans byte-identically before and after compaction, the compaction report
+keeps its three integer fields, and the next commit after compaction is
+still `seq + 1` (an empty commit in between changes nothing). Keys and
+values remain raw bytes throughout; no encoding conversion is applied.
+
 `wal_store.Store(path, read_only=True)` opens an isolated reader. Any
 number of read-only processes may coexist with the single writer in the
 same directory. A reader takes no lock and never creates or changes a
@@ -65,8 +89,9 @@ Successive reads from the same reader may advance across snapshots only by
 reopening; each read is of one fully committed snapshot. Reads do not
 replay the log and do not block the writer: killing or suspending a reader
 never affects the writer's commits, recovery or stats. `put`, `delete`,
-`commit` and `recover` are rejected on a read-only store; `stats` reports
-the pinned snapshot and `get` is the normal way to read it. Readers serve
+`delete_range`, `commit` and `recover` are rejected on a read-only store;
+`stats` reports the pinned snapshot and `get` is the normal way to read
+it. Readers serve
 from the atomically replaced `wal.ckp` sidecar (and the committed log
 prefix), so directories written by older versions open directly.
 
@@ -81,7 +106,8 @@ which case its `wal.log` is used. A negative or past-the-end offset raises
 
 `recover()` returns a report with three integer fields, in this key order:
 
-- `applied` — committed put/delete records replayed into the state,
+- `applied` — committed put/delete/range-delete records replayed into the
+  state,
 - `discarded` — torn tail records dropped (at most one, the unfinished final
   write left by a process killed mid append; `0` on a clean log),
 - `seq` — the durable sequence number after recovery.
