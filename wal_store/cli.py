@@ -37,6 +37,21 @@ def _write_stdout(data: bytes) -> None:
         sys.stdout.flush()
 
 
+def _write_stderr(data: bytes) -> None:
+    """Write raw bytes to stderr without any newline translation.
+
+    Same binary rule as ``_write_stdout``: the one error line must come out
+    byte-identical on every platform, never with its LF expanded to CRLF.
+    """
+    buffer = getattr(sys.stderr, "buffer", None)
+    if buffer is not None:
+        buffer.write(data)
+        buffer.flush()
+    else:  # pragma: no cover - text-only stderr environments
+        sys.stderr.write(data.decode("utf-8"))
+        sys.stderr.flush()
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="wal_store",
@@ -93,7 +108,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             _write_stdout(line.encode("utf-8"))
             return 0
     except (ValueError, TypeError, OSError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        # One explanatory line on stderr, written as raw bytes so the LF is
+        # not expanded to CRLF on Windows; no JSON report on a failure.
+        _write_stderr(f"error: {exc}\n".encode("utf-8"))
         return 3
 
     return 2

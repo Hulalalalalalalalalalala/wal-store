@@ -29,7 +29,31 @@ line subcommand creates it).
 - `compact() -> dict` rewrites committed history into one tight log and
   reclaims the old space, without changing the committed state or the
   durable sequence.
+- `scan(start=None, end=None) -> ScanCursor` opens an ordered read-only
+  cursor over the committed snapshot pinned at that moment.
 - `stats() -> dict` reports sequence, entries and bytes.
+
+## Scanning
+
+`scan()` works on both open forms and never touches the write path. The
+returned cursor is an iterator of `(key, value)` pairs in bytewise key
+order — keys compare by their raw UTF-8 bytes and values come back as the
+exact stored bytes, with no encoding conversion — covering `start`
+inclusive through `end` exclusive; a `None` endpoint leaves that side
+unbounded, so `scan()` walks everything. Keys that only ever appeared in
+delete records never show up, a key overwritten any number of times yields
+only its last committed value, and empty values scan like any other. A
+writer's uncommitted changes are not part of the snapshot; a read-only
+store scans the snapshot it pinned at open.
+
+The snapshot is materialised once when the cursor opens, so later commits,
+compaction, crash recovery and reclamation of the old log space never
+change what the cursor yields, and the same snapshot scans to the identical
+sequence before and after compaction. Scanning never replays the log,
+takes no lock and keeps no history in memory, so its cost is independent
+of the log's length. A `start` that sorts after `end` raises `ValueError`,
+as does reading from a cursor after `close()` (the cursor is also a
+context manager).
 
 `wal_store.Store(path, read_only=True)` opens an isolated reader. Any
 number of read-only processes may coexist with the single writer in the

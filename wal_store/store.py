@@ -33,6 +33,20 @@ make the convergence protocol kill-safe and its report stable:
     stable across reopens and repeated recoveries. It is removed by the next
     successful commit.
 
+Range scans (``Store.scan(start, end)``) open an ordered read-only cursor
+over the complete committed snapshot pinned at the moment the cursor is
+opened. The cursor yields ``(key, value)`` pairs in bytewise key order --
+keys compare by their raw UTF-8 bytes, with no encoding conversion -- from
+``start`` (inclusive) to ``end`` (exclusive); a ``None`` endpoint leaves
+that side unbounded. Keys that only ever appear in delete records never
+show up, a key overwritten many times yields only its last committed value,
+and empty values scan like any other. The snapshot is materialised once
+when the cursor opens, so commits, compaction or crash recovery during the
+scan never change it, reclaiming the old log space cannot break it, and the
+cost of a scan is independent of how long the log's history is. A reversed
+range (``start`` after ``end``) and any read from a closed cursor raise
+``ValueError``.
+
 Read-only processes (``Store(path, read_only=True)``) take no lock and never
 create or modify a file. At open each one picks the highest committed prefix
 available at that instant -- the validated ``wal.log`` prefix or ``wal.ckp``
@@ -98,7 +112,7 @@ import os
 import sys
 import zlib
 
-__all__ = ["Store", "CorruptLogError", "inject_tear"]
+__all__ = ["Store", "ScanCursor", "CorruptLogError", "inject_tear"]
 
 
 class CorruptLogError(ValueError):
@@ -109,6 +123,57 @@ class CorruptLogError(ValueError):
     metadata or commit-sequence validation is corruption; recovery stops
     without applying or removing anything.
     """
+
+
+class ScanCursor:
+    """Ordered read-only cursor over one pinned committed snapshot.
+
+    Created by :meth:`Store.scan`. Iterating yields ``(key, value)`` pairs
+    in bytewise key order -- keys ordered by their raw UTF-8 bytes, values
+    returned as the exact stored bytes -- covering the range given at open:
+    the start key inclusive, the end key exclusive, either side unbounded
+    when its endpoint was ``None``.
+
+    The snapshot is fully materialised when the cursor opens, so later
+    commits, compaction, crash recovery or reclamation of the old log space
+    never change what the cursor yields, and closing the store it came from
+    does not disturb it. The cursor is an iterator; it is also a context
+    manager, and ``close()`` releases the snapshot early. Reading from a
+    closed cursor raises ``ValueError``.
+    """
+
+    def __init__(self, items):
+        # ``items`` is the materialised snapshot: (key, value) pairs already
+        # sorted by the keys' raw UTF-8 bytes and clipped to the range.
+        self._items = items
+        self._pos = 0
+        self._closed = False
+
+    def __iter__(self) -> "ScanCursor":
+        return self
+
+    def __next__(self):
+        if self._closed:
+            raise ValueError("scan cursor is closed")
+        if self._pos >= len(self._items):
+            raise StopIteration
+        item = self._items[self._pos]
+        self._pos += 1
+        return item
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def close(self) -> None:
+        self._items = []
+        self._closed = True
+
+    def __enter__(self) -> "ScanCursor":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
 
 
 LOG_NAME = "wal.log"
@@ -127,6 +192,12 @@ _OP_DELETE = "d"
 _OP_COMMIT = "c"
 _OP_BASE = "b"
 _COMMIT_OPS = (_OP_COMMIT, _OP_BASE)
+
+# os.open defaults to the C runtime's text mode on Windows, which would
+# expand every "\n" to "\r\n" inside os.write and inflate the log on disk.
+# Forcing binary keeps the log bytes identical on every platform; the flag
+# does not exist elsewhere, where it is 0.
+_O_BINARY = getattr(os, "O_BINARY", 0)
 
 
 def _encode_frame(op: str, value: bytes = b"", key: str | None = None,
@@ -301,6 +372,15 @@ class Store:
     visible. ``put``, ``delete``, ``commit``, ``recover`` and ``compact``
     are rejected on a read-only store; ``stats`` reports the pinned
     snapshot.
+
+    ``scan(start, end)`` -- on either open form -- returns a
+    :class:`ScanCursor` over the complete committed snapshot pinned at the
+    moment of the call, yielding ``(key, value)`` pairs in bytewise key
+    order from ``start`` (inclusive) to ``end`` (exclusive); a ``None``
+    endpoint leaves that side unbounded. Uncommitted session changes of a
+    writer are not part of the snapshot. The cursor reads from memory only:
+    it never touches the log, takes no lock, and is unaffected by later
+    commits, compaction, recovery or the store closing.
     """
 
     def __init__(self, path: str, read_only: bool = False):
@@ -325,6 +405,10 @@ class Store:
         self._pending = 0
         self._closed = False
         self._corrupt = False
+        # Committed value of each key this session has touched since the
+        # last commit (None when the key was absent); lets a scan pin the
+        # committed snapshot without replaying the log.
+        self._touched: dict[str, bytes | None] = {}
         # Torn records dropped in this recovery epoch; wal.rec carries it
         # across processes until the next commit.
         self._discarded = 0
@@ -337,7 +421,8 @@ class Store:
             return
 
         log_created = not os.path.exists(self._path)
-        self._fd = os.open(self._path, os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+        self._fd = os.open(self._path,
+                           os.O_WRONLY | os.O_CREAT | os.O_APPEND | _O_BINARY,
                            0o644)
         if log_created:
             os.fsync(self._fd)
@@ -588,7 +673,8 @@ class Store:
             _fsync_dir(self._dir)
         finally:
             self._fd = os.open(
-                self._path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+                self._path,
+                os.O_WRONLY | os.O_CREAT | os.O_APPEND | _O_BINARY, 0o644)
         if os.fstat(self._fd).st_size != clean_end:
             raise CorruptLogError("restore did not converge")
 
@@ -697,7 +783,8 @@ class Store:
             _fsync_dir(self._dir)
         finally:
             self._fd = os.open(
-                self._path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+                self._path,
+                os.O_WRONLY | os.O_CREAT | os.O_APPEND | _O_BINARY, 0o644)
         if os.fstat(self._fd).st_size != len(image):
             raise CorruptLogError("compaction did not converge")
 
@@ -862,6 +949,7 @@ class Store:
         self._seq = self._last_seq(frames)
         self._entries = len(frames)
         self._pending = 0
+        self._touched = {}
         self._discarded = discarded
         self._corrupt = False
 
@@ -971,6 +1059,25 @@ class Store:
         value = self._ro_index.get(key)
         return None if value is None else bytes(value)
 
+    def _committed_view(self) -> dict[str, bytes]:
+        """The writer's committed state, undoing uncommitted session edits.
+
+        ``self._data`` folds uncommitted puts/deletes into the committed
+        state; ``self._touched`` remembers what each touched key held at the
+        last commit (``None`` when absent), so the committed snapshot is
+        recovered without replaying the log. With nothing pending the live
+        dict is returned as is -- the caller copies it into the cursor.
+        """
+        if not self._touched:
+            return self._data
+        data = dict(self._data)
+        for key, old in self._touched.items():
+            if old is None:
+                data.pop(key, None)
+            else:
+                data[key] = old
+        return data
+
     # -- argument validation ----------------------------------------------
 
     @staticmethod
@@ -1000,6 +1107,8 @@ class Store:
         if not isinstance(value, bytes):
             raise TypeError("value must be bytes")
         _write_all(self._fd, _encode_frame(_OP_PUT, value=value, key=key))
+        if key not in self._touched:
+            self._touched[key] = self._data.get(key)
         self._data[key] = value
         self._pending += 1
         self._entries += 1
@@ -1011,10 +1120,54 @@ class Store:
             return self._read_key(key)
         return self._data.get(key)
 
+    def scan(self, start: str | None = None,
+             end: str | None = None) -> ScanCursor:
+        """Open an ordered cursor over the pinned committed snapshot.
+
+        The cursor yields ``(key, value)`` pairs in bytewise key order --
+        keys compared by their raw UTF-8 bytes, values returned as the exact
+        stored bytes -- covering ``start`` (inclusive) through ``end``
+        (exclusive). A ``None`` endpoint leaves that side unbounded, so
+        ``scan()`` walks the whole snapshot. Keys that only ever appeared in
+        delete records are absent, a key overwritten any number of times
+        yields only its last committed value, and empty values scan like any
+        other. A writer's uncommitted session changes are not part of the
+        snapshot; a read-only store scans the snapshot it pinned at open.
+
+        The snapshot is materialised once, here, so the cursor is
+        independent of later commits, compaction, crash recovery and log
+        space reclamation, and its cost is independent of the log's history
+        length. A ``start`` that sorts after ``end`` raises ``ValueError``,
+        as does reading from the cursor after it is closed.
+        """
+        self._ensure_open()
+        for endpoint in (start, end):
+            if endpoint is not None and not isinstance(endpoint, str):
+                raise TypeError("scan endpoints must be strings or None")
+        lo = start.encode("utf-8") if start is not None else None
+        hi = end.encode("utf-8") if end is not None else None
+        if lo is not None and hi is not None and lo > hi:
+            raise ValueError(
+                f"scan start {start!r} sorts after scan end {end!r}")
+
+        data = self._ro_index if self._read_only else self._committed_view()
+        items = []
+        for key, value in data.items():
+            key_bytes = key.encode("utf-8")
+            if lo is not None and key_bytes < lo:
+                continue
+            if hi is not None and key_bytes >= hi:
+                continue
+            items.append((key_bytes, key, bytes(value)))
+        items.sort(key=lambda item: item[0])
+        return ScanCursor([(key, value) for _kb, key, value in items])
+
     def delete(self, key: str) -> None:
         self._ensure_writable()
         self._check_key(key)
         _write_all(self._fd, _encode_frame(_OP_DELETE, key=key))
+        if key not in self._touched:
+            self._touched[key] = self._data.get(key)
         self._data.pop(key, None)
         self._pending += 1
         self._entries += 1
@@ -1034,6 +1187,7 @@ class Store:
         had_marker = os.path.exists(self._marker_path)
         self._seq += 1
         self._pending = 0
+        self._touched = {}
         self._entries += 1
         self._discarded = 0
         if had_marker:
@@ -1070,6 +1224,7 @@ class Store:
         self._seq = seq
         self._entries = len(frames)
         self._pending = 0
+        self._touched = {}
         self._discarded = discarded
         self._corrupt = False
         return {"applied": applied, "discarded": discarded, "seq": seq}
@@ -1110,6 +1265,7 @@ class Store:
         self._seq = seq
         self._entries = len(frames)
         self._pending = 0
+        self._touched = {}
         self._discarded = discarded
         self._corrupt = False
 
