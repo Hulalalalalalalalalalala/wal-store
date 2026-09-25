@@ -15,8 +15,9 @@ These tests cover:
   is always the exact pinned snapshot;
 * a writer's single-key reads and scans both seeing only the last committed
   snapshot while uncommitted changes are staged;
-* read-only stores never creating or modifying a file, even when minting a
-  token, while the token still resolves once a writer holds the snapshot;
+* read-only stores writing nothing but a short-lived lease sidecar --
+  gone again once closed -- even when minting a token, while the token
+  still resolves once a writer holds the snapshot;
 * forged, truncated, corrupted, mistyped, out-of-range, foreign-store and
   cross-snapshot tokens all raising ``ValueError``/``TypeError``, never
   being guessed into a result;
@@ -387,10 +388,14 @@ class ReadOnlyNoWritesTest(TokenBase):
             next(cur)
             tok = cur.token()
             self.assertEqual(list(r.scan(token=tok)), [("b", b"b")])
+            # Open cursors and readers hold a short-lived lease sidecar;
+            # once everything is closed the directory is byte-identical.
+            cur.close()
         self.assertEqual(self.listing(), before)
 
     def test_reader_scan_creates_nothing_on_old_directory(self):
-        # Only wal.log: an old version. A reader must add no wal.s* file.
+        # Only wal.log: an old version. A reader must add no wal.s* file,
+        # and its lease sidecar is gone again once it closes.
         self.seed(["a"])
         for name in list(os.listdir(self.dir)):
             if name != "wal.log":
@@ -401,6 +406,7 @@ class ReadOnlyNoWritesTest(TokenBase):
             next(cur)
             cur.token()
             list(r.scan())
+            cur.close()
         self.assertEqual(set(os.listdir(self.dir)), {"wal.log"})
 
 

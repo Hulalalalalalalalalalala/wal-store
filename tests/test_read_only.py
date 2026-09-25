@@ -7,7 +7,9 @@ These tests cover:
 * many reader processes running alongside a continuously committing writer,
   each observing a coherent key/value snapshot, while the writer is never
   blocked and is unaffected by readers that are killed or hang;
-* the read-only hard boundary -- no file is created, modified or deleted;
+* the read-only hard boundary -- no existing file is created, modified or
+  deleted; the one thing a reader may write is its own short-lived lease
+  sidecar, removed again when it closes;
 * reads served from the atomically replaced ``wal.ckp`` sidecar and from a
   torn log rebuilt view, and from old directories that have no fresh state;
 * corruption still raising ``wal_store.CorruptLogError`` and a missing

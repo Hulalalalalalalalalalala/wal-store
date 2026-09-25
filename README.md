@@ -122,12 +122,21 @@ every commit and every compaction (and is finished at every writer open,
 so a sweep killed mid-run simply completes on reopen):
 
 - **In use** — a copy is never reclaimed while any open cursor (including
-  one merely iterating, with no token minted) or any live read-only store
-  is serving that snapshot. An in-use token keeps pointing at the same
+  one merely iterating, with no token minted), any resumed scan or any
+  live read-only store is serving that snapshot — in this process *or in
+  another*. Every cursor, resumed scan and read-only store registers a
+  short-lived `wal.lease.<pid>.<seq>.<id>` sidecar when it opens (the one
+  file kind a read-only open may write), and the writer's reclamation
+  treats every snapshot named by a live lease as in use. The lease is
+  refreshed by a heartbeat while its holder runs and removed when it
+  closes; a holder that is killed leaves its lease to expire — by its
+  process id being gone or its heartbeat going stale — and only then may
+  the snapshot be reclaimed. An in-use token keeps pointing at the same
   snapshot across commits, compactions and crash recovery; resuming it is
   byte-for-byte the tail of the original one-shot scan. Reclamation
-  deletes only redundant copies — the reads and resumes in flight do not
-  change by a byte, and a deleted key never comes back.
+  deletes only redundant copies and expired leases — the reads and
+  resumes in flight do not change by a byte, and a deleted key never
+  comes back.
 - **Always retained** — the current committed snapshot and the newest
   three published predecessor generations are never reclaimed.
 - **Everything else** — copies outside the retention window with no user
@@ -146,9 +155,13 @@ a directory sync at the end, so a kill at any point leaves a state the
 next open converges to the identical file set. It cannot delete an
 in-use copy, cannot move the durable sequence or the committed state,
 and never touches `wal.log`, `wal.ckp` or any record; it removes only
-dead `wal.s<seq>.<id>` copies. It adds no command-line subcommand and no
-new files: everything lives in the same store directory behind the
-existing `scan`/token calls.
+dead `wal.s<seq>.<id>` copies and expired `wal.lease.*` sidecars. Lease
+registration, expiry and reclamation converge the same way: a holder
+killed at any point — mid-registration, mid-heartbeat, mid-sweep —
+leaves a state the next open settles to the same in-use snapshot set and
+the same copy files. It adds no command-line subcommand and only one new
+file kind, the short-lived lease sidecar: everything lives in the same
+store directory behind the existing `scan`/token calls.
 
 
 ## Range deletes
@@ -183,8 +196,12 @@ scans to the identical bytes before and after compaction.
 
 `wal_store.Store(path, read_only=True)` opens an isolated reader. Any
 number of read-only processes may coexist with the single writer in the
-same directory. A reader takes no lock and never creates or changes a
-file; it pins a snapshot at open time and every `get` reads from that one
+same directory. A reader takes no lock and never creates or changes an
+existing file; the one thing it may write is its own short-lived
+`wal.lease.<pid>.<seq>.<id>` sidecar registering the snapshot it pinned
+as in use across processes — removed when the reader closes and expiring
+on its own (by exit detection or heartbeat staleness) when the reader is
+killed. It pins a snapshot at open time and every `get` reads from that one
 complete committed snapshot, so uncommitted mutations, a half-written
 commit, a torn record or a half-finished shrink are never visible.
 Successive reads from the same reader may advance across snapshots only by

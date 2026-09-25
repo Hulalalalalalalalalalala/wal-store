@@ -395,7 +395,9 @@ class ReaderDuringCompactionTest(CompactBase):
         readers = [subprocess.Popen(
             [sys.executable, "-c", HUNG_READER, self.dir, "6"],
             stdout=subprocess.PIPE) for _ in range(3)]
-        time.sleep(0.4)
+        # Each reader prints its first snapshot only after pinning it;
+        # wait for all three to be there instead of racing a fixed sleep.
+        first_lines = [p.stdout.readline() for p in readers]
         with Store(self.dir) as s:
             report = s.compact()
             self.assertEqual(report["seq"], pinned_seq)
@@ -406,11 +408,11 @@ class ReaderDuringCompactionTest(CompactBase):
             self.assertEqual(r.get("k01"), b"v59")
             self.assertEqual(r.get("k02"), b"after")
             self.assertEqual(r.stats()["seq"], pinned_seq + 1)
-        for p in readers:
+        for p, first in zip(readers, first_lines):
             out, err = p.communicate(timeout=15)
             self.assertEqual(p.returncode, 0, err)
             lines = out.decode().splitlines()
-            before, after = json.loads(lines[0]), json.loads(lines[-1])
+            before, after = json.loads(first), json.loads(lines[-1])
             self.assertEqual(before, after)
             self.assertEqual(before["seq"], pinned_seq)
             self.assertEqual(before["snap"],
