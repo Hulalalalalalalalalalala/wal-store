@@ -70,6 +70,19 @@ backwards. Every repair step is either idempotent or an atomic rename; a
 kill between any two steps leaves a state the next open converges from to
 the identical result.
 
+Range scans (``Store.scan(start, end)``) hand out an ordered cursor over
+the committed snapshot pinned at the moment the cursor opens. The cursor
+materialises the matching live keys once, sorted by their raw bytes, and
+then serves them independently of the store: commits, compaction or crash
+recovery that happen while it is being read never change what it yields,
+and it keeps reading after the log space its snapshot came from has been
+reclaimed. Keys that only ever appeared in delete history never show up,
+an overwritten key yields only its last committed value, and empty values
+are returned like any other. The range is half-open -- the start key is
+included, the end key excluded, and a ``None`` endpoint leaves that side
+unbounded. Scan cost tracks the number of live keys, never the length of
+the log history, and a scan never takes a lock or writes a file.
+
 Log frame layout (all integers big-endian)::
 
     +---------+----------------+------------+----------------------+---------+
@@ -98,7 +111,7 @@ import os
 import sys
 import zlib
 
-__all__ = ["Store", "CorruptLogError", "inject_tear"]
+__all__ = ["Store", "ScanCursor", "CorruptLogError", "inject_tear"]
 
 
 class CorruptLogError(ValueError):
@@ -127,6 +140,11 @@ _OP_DELETE = "d"
 _OP_COMMIT = "c"
 _OP_BASE = "b"
 _COMMIT_OPS = (_OP_COMMIT, _OP_BASE)
+
+# os.open() defaults to text mode on Windows, which would inflate every
+# b"\n" payload byte to CRLF on write; the log must be strictly binary so
+# the same history lands as the same bytes on every platform.
+_O_BINARY = getattr(os, "O_BINARY", 0)
 
 
 def _encode_frame(op: str, value: bytes = b"", key: str | None = None,
@@ -215,19 +233,19 @@ def _fsync_dir(path: str) -> None:
     working everywhere. Other platforms occasionally refuse the directory
     open or the fsync the same way (restrictive mounts, virtualised FSes);
     that is likewise best-effort -- the file's own fsync is what carries the
-    data -- so a ``PermissionError`` at either step never aborts store
-    creation or a commit/compaction.
+    data -- so the system refusing either step never aborts store creation
+    or a commit/compaction.
     """
     if sys.platform == "win32":
         return
     try:
         fd = os.open(path, os.O_RDONLY)
-    except PermissionError:
+    except OSError:
         return
     try:
         try:
             os.fsync(fd)
-        except PermissionError:
+        except OSError:
             # Some non-Windows mounts reject directory fsync the same way.
             pass
     finally:
@@ -281,6 +299,48 @@ def inject_tear(source, destination, offset):
     return dst
 
 
+class ScanCursor:
+    """Ordered cursor over one pinned committed snapshot.
+
+    Yields ``(key, value)`` pairs in raw key-byte order. The snapshot is
+    fully materialised when the cursor is created, so later commits,
+    compaction, crash recovery or reclamation of the underlying log space
+    never change what it yields and can never make it fail. The cursor is
+    independent of the store it came from; closing the store does not
+    close it.
+
+    Reading a closed cursor raises ``ValueError``. ``close()`` is
+    idempotent, and the cursor is a context manager.
+    """
+
+    def __init__(self, items):
+        self._items = items
+        self._pos = 0
+        self._closed = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._closed:
+            raise ValueError("scan cursor is closed")
+        if self._pos >= len(self._items):
+            raise StopIteration
+        item = self._items[self._pos]
+        self._pos += 1
+        return item
+
+    def close(self) -> None:
+        self._closed = True
+        self._items = []
+
+    def __enter__(self) -> "ScanCursor":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+
 class Store:
     """A single-writer key value store backed by an append-only log.
 
@@ -301,6 +361,12 @@ class Store:
     visible. ``put``, ``delete``, ``commit``, ``recover`` and ``compact``
     are rejected on a read-only store; ``stats`` reports the pinned
     snapshot.
+
+    ``scan(start, end)`` -- on either open form -- returns an ordered
+    cursor over the committed snapshot pinned at that moment, yielding
+    ``(key, value)`` pairs in raw key-byte order over the half-open range.
+    The cursor is materialised at open and is then independent of the
+    store and of everything that later happens to the log.
     """
 
     def __init__(self, path: str, read_only: bool = False):
@@ -320,6 +386,11 @@ class Store:
             raise OSError(f"store path is not a directory: {path!r}")
 
         self._data: dict[str, bytes] = {}
+        # Keys touched since the last commit, mapped to the value they held
+        # in the committed state (None when the key was absent). It lets a
+        # scan pin the committed snapshot without replaying the log, while
+        # costing memory only for as-yet uncommitted keys.
+        self._uncommitted: dict[str, bytes | None] = {}
         self._seq = 0
         self._entries = 0
         self._pending = 0
@@ -337,7 +408,8 @@ class Store:
             return
 
         log_created = not os.path.exists(self._path)
-        self._fd = os.open(self._path, os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+        self._fd = os.open(self._path,
+                           os.O_WRONLY | os.O_CREAT | os.O_APPEND | _O_BINARY,
                            0o644)
         if log_created:
             os.fsync(self._fd)
@@ -588,7 +660,8 @@ class Store:
             _fsync_dir(self._dir)
         finally:
             self._fd = os.open(
-                self._path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+                self._path,
+                os.O_WRONLY | os.O_CREAT | os.O_APPEND | _O_BINARY, 0o644)
         if os.fstat(self._fd).st_size != clean_end:
             raise CorruptLogError("restore did not converge")
 
@@ -697,7 +770,8 @@ class Store:
             _fsync_dir(self._dir)
         finally:
             self._fd = os.open(
-                self._path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+                self._path,
+                os.O_WRONLY | os.O_CREAT | os.O_APPEND | _O_BINARY, 0o644)
         if os.fstat(self._fd).st_size != len(image):
             raise CorruptLogError("compaction did not converge")
 
@@ -859,6 +933,7 @@ class Store:
     def _publish(self, frames, discarded) -> None:
         state, _applied = self._replay(frames)
         self._data = state
+        self._uncommitted.clear()
         self._seq = self._last_seq(frames)
         self._entries = len(frames)
         self._pending = 0
@@ -971,6 +1046,22 @@ class Store:
         value = self._ro_index.get(key)
         return None if value is None else bytes(value)
 
+    def _committed_view(self) -> dict[str, bytes]:
+        """The writer's committed state, with uncommitted edits folded out.
+
+        Costs nothing when there are no pending changes; otherwise copies
+        the live state and restores each pending key's committed value.
+        """
+        if not self._uncommitted:
+            return self._data
+        view = dict(self._data)
+        for key, old in self._uncommitted.items():
+            if old is None:
+                view.pop(key, None)
+            else:
+                view[key] = old
+        return view
+
     # -- argument validation ----------------------------------------------
 
     @staticmethod
@@ -979,6 +1070,15 @@ class Store:
             raise TypeError("key must be a string")
         if key == "":
             raise ValueError("key must not be empty")
+
+    @staticmethod
+    def _scan_endpoint(value, name: str) -> bytes | None:
+        """Validate a scan endpoint and return its raw ordering bytes."""
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise TypeError(f"scan {name} endpoint must be a string or None")
+        return value.encode("utf-8")
 
     def _ensure_open(self) -> None:
         if self._closed:
@@ -1000,6 +1100,8 @@ class Store:
         if not isinstance(value, bytes):
             raise TypeError("value must be bytes")
         _write_all(self._fd, _encode_frame(_OP_PUT, value=value, key=key))
+        if key not in self._uncommitted:
+            self._uncommitted[key] = self._data.get(key)
         self._data[key] = value
         self._pending += 1
         self._entries += 1
@@ -1011,10 +1113,58 @@ class Store:
             return self._read_key(key)
         return self._data.get(key)
 
+    def scan(self, start: str | None = None,
+             end: str | None = None) -> ScanCursor:
+        """Iterate the pinned committed snapshot in raw key-byte order.
+
+        Returns a :class:`ScanCursor` yielding ``(key, value)`` pairs for
+        every committed key in the half-open range ``[start, end)``: the
+        start key is included, the end key excluded, and a ``None``
+        endpoint leaves that side unbounded. Keys are ordered by their raw
+        bytes; keys and values come back exactly as stored, with no
+        encoding conversion. Keys that only ever appeared in delete
+        history never show up, a key overwritten any number of times
+        yields only its last committed value, and empty values are
+        returned like any other.
+
+        The cursor materialises the matching live keys once, at open, and
+        is then independent of the store: commits, compaction or crash
+        recovery that happen while it is being read never change what it
+        yields, and it keeps reading after the log space its snapshot came
+        from has been reclaimed. Its cost tracks the number of live keys,
+        never the length of the log history, and it never takes a lock or
+        writes a file -- a read-only store scans its pinned snapshot
+        without touching anything on disk.
+
+        A ``start`` that sorts after ``end`` raises ``ValueError``, as
+        does reading from a closed cursor. Non-string endpoints raise
+        ``TypeError``.
+        """
+        self._ensure_open()
+        start_b = self._scan_endpoint(start, "start")
+        end_b = self._scan_endpoint(end, "end")
+        if start_b is not None and end_b is not None and start_b > end_b:
+            raise ValueError(
+                f"scan start {start!r} sorts after scan end {end!r}")
+
+        source = self._ro_index if self._read_only else self._committed_view()
+        matched = []
+        for key, value in source.items():
+            key_b = key.encode("utf-8")
+            if start_b is not None and key_b < start_b:
+                continue
+            if end_b is not None and key_b >= end_b:
+                continue
+            matched.append((key_b, key, value))
+        matched.sort(key=lambda item: item[0])
+        return ScanCursor([(key, value) for _kb, key, value in matched])
+
     def delete(self, key: str) -> None:
         self._ensure_writable()
         self._check_key(key)
         _write_all(self._fd, _encode_frame(_OP_DELETE, key=key))
+        if key not in self._uncommitted:
+            self._uncommitted[key] = self._data.get(key)
         self._data.pop(key, None)
         self._pending += 1
         self._entries += 1
@@ -1034,6 +1184,7 @@ class Store:
         had_marker = os.path.exists(self._marker_path)
         self._seq += 1
         self._pending = 0
+        self._uncommitted.clear()
         self._entries += 1
         self._discarded = 0
         if had_marker:
@@ -1070,6 +1221,7 @@ class Store:
         self._seq = seq
         self._entries = len(frames)
         self._pending = 0
+        self._uncommitted.clear()
         self._discarded = discarded
         self._corrupt = False
         return {"applied": applied, "discarded": discarded, "seq": seq}
@@ -1110,6 +1262,7 @@ class Store:
         self._seq = seq
         self._entries = len(frames)
         self._pending = 0
+        self._uncommitted.clear()
         self._discarded = discarded
         self._corrupt = False
 

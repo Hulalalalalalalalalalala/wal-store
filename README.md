@@ -29,6 +29,8 @@ line subcommand creates it).
 - `compact() -> dict` rewrites committed history into one tight log and
   reclaims the old space, without changing the committed state or the
   durable sequence.
+- `scan(start=None, end=None) -> ScanCursor` iterates the pinned committed
+  snapshot in raw key-byte order over the half-open range `[start, end)`.
 - `stats() -> dict` reports sequence, entries and bytes.
 
 `wal_store.Store(path, read_only=True)` opens an isolated reader. Any
@@ -45,6 +47,31 @@ never affects the writer's commits, recovery or stats. `put`, `delete`,
 the pinned snapshot and `get` is the normal way to read it. Readers serve
 from the atomically replaced `wal.ckp` sidecar (and the committed log
 prefix), so directories written by older versions open directly.
+
+## Range scans
+
+`scan(start=None, end=None)` — on a normal or a read-only store — returns
+an ordered cursor over the committed snapshot pinned at that instant. The
+cursor yields `(key, value)` pairs in raw key-byte order over the
+half-open range `[start, end)`: the start key is included, the end key
+excluded, and a `None` endpoint leaves that side unbounded. Keys and
+values come back exactly as stored, with no encoding conversion; keys
+with high bytes order by their raw bytes. Keys that only ever appeared in
+delete history never show up, a key overwritten any number of times
+yields only its last committed value, and empty values are returned like
+any other.
+
+The cursor materialises the matching live keys once, at open, and is then
+independent of the store: commits, compaction or crash recovery that
+happen while it is being read never change what it yields, and it keeps
+reading after the log space its snapshot came from has been reclaimed.
+Scanning the same committed state before and after a compaction yields
+the identical key/value sequence. Scan cost tracks the number of live
+keys, never the length of the log history; a scan never replays the log,
+takes a lock, or writes a file, so read-only stores scan their pinned
+snapshot without touching anything on disk. A `start` that sorts after
+`end` raises `ValueError`, as does reading from a closed cursor;
+non-string endpoints raise `TypeError`.
 
 `wal_store.inject_tear(source, destination, offset)` is a verification aid:
 it writes a byte-for-byte copy of `source` cut at exactly `offset` bytes (a
