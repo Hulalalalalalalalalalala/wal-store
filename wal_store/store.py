@@ -1,9 +1,14 @@
 """Write-ahead log key value store.
 
 Every mutation is first appended to a framed log. A commit marker is the
-only thing that advances the durable sequence number. When a store is opened,
-any tail that was never committed (including a record torn by a hard kill) is
-discarded, so recovery always yields exactly the committed state.
+only thing that advances the durable sequence number, and every
+``commit()`` writes one -- including an empty commit with nothing pending,
+which advances the sequence by exactly one like any other commit. When a
+store is opened, any tail that was never committed (including a record
+torn by a hard kill) is discarded, so recovery always yields exactly the
+committed state. Single-key reads and scans of a writer both see only the
+last committed snapshot; uncommitted session changes are invisible to
+either.
 
 Only the very last log record may be incomplete: a process killed while
 appending leaves at most one torn record, which is dropped without being
@@ -46,6 +51,25 @@ scan never change it, reclaiming the old log space cannot break it, and the
 cost of a scan is independent of how long the log's history is. A reversed
 range (``start`` after ``end``) and any read from a closed cursor raise
 ``ValueError``.
+
+A cursor's position serialises into an opaque ``bytes`` token via
+``ScanCursor.token()``. The token names the pinned snapshot -- its durable
+sequence number and a content identity over the snapshot's canonical image
+-- together with the scan range and the next position. Passing it back as
+``Store.scan(token=...)`` -- in the same process or in a freshly opened
+store, writer or read-only -- continues the identical range from the
+identical position over the identical snapshot, so the resumed stream is
+byte-for-byte the tail of the original scan. Tokens stay valid across
+later commits, compaction, crash recovery and reclamation of the old log
+space: a writer durably publishes the pinned snapshot as an immutable
+``wal.s<seq>.<id>`` sidecar when a token is minted, and snapshots that
+were never published still resolve from the committed log prefix or the
+checkpoint. Deleted keys -- including keys covered by range tombstones
+that compaction has since reclaimed -- never reappear: the resumed stream
+is always exactly the pinned snapshot. A token that is forged, truncated,
+corrupted, out of range or names a snapshot the store does not hold raises
+``ValueError`` with no guessing or repair; the token bytes are
+platform-independent and identical for the same snapshot and position.
 
 Range deletes (``Store.delete_range(start, end)``, or ``delete(start,
 end)``) use the very same endpoints and half-open bytewise convention as
@@ -128,10 +152,13 @@ tombstone can never make one reappear.
 
 from __future__ import annotations
 
+import bisect
+import hashlib
 import io
 import json
 import os
 import sys
+import weakref
 import zlib
 
 __all__ = ["Store", "ScanCursor", "CorruptLogError", "inject_tear"]
@@ -162,13 +189,31 @@ class ScanCursor:
     does not disturb it. The cursor is an iterator; it is also a context
     manager, and ``close()`` releases the snapshot early. Reading from a
     closed cursor raises ``ValueError``.
+
+    :meth:`token` serialises the current position into an opaque ``bytes``
+    token naming the pinned snapshot, the scan range and the next position.
+    ``Store.scan(token=...)`` -- in this process or in a freshly opened
+    store -- continues the identical scan from that position.
     """
 
-    def __init__(self, items):
+    def __init__(self, items, lo_idx=0, hi_idx=None, pos=None, seq=0,
+                 lo=None, hi=None, publisher=None):
         # ``items`` is the materialised snapshot: (key, value) pairs already
-        # sorted by the keys' raw UTF-8 bytes and clipped to the range.
+        # sorted by the keys' raw UTF-8 bytes. The visible window is
+        # [lo_idx, hi_idx) and the next position starts at ``pos``.
         self._items = items
-        self._pos = 0
+        self._lo_idx = lo_idx
+        self._hi_idx = len(items) if hi_idx is None else hi_idx
+        self._pos = lo_idx if pos is None else pos
+        self._seq = seq
+        self._lo = lo
+        self._hi = hi
+        # Writer-only callback durably publishing the pinned snapshot so a
+        # minted token survives compaction and reclamation; ``None`` on
+        # read-only stores, which never create or modify any file.
+        self._publisher = publisher
+        self._sid = None
+        self._box = None
         self._closed = False
 
     def __iter__(self) -> "ScanCursor":
@@ -177,11 +222,41 @@ class ScanCursor:
     def __next__(self):
         if self._closed:
             raise ValueError("scan cursor is closed")
-        if self._pos >= len(self._items):
+        if self._pos >= self._hi_idx:
             raise StopIteration
         item = self._items[self._pos]
         self._pos += 1
         return item
+
+    def token(self) -> bytes:
+        """Serialise the current position into an opaque scan token.
+
+        The returned ``bytes`` name the pinned snapshot (its durable
+        sequence number and content identity), the scan range and the next
+        position. Feeding the token to ``Store.scan(token=...)`` -- in this
+        process or in a freshly opened store, writer or read-only -- opens
+        a cursor that continues the same range from the same position over
+        the same pinned snapshot, byte-identical to the tail of this scan.
+
+        Token bytes are platform-independent and deterministic: the same
+        snapshot at the same position always mints the same token. On a
+        writer store minting also publishes the pinned snapshot as an
+        immutable sidecar so the token survives compaction and reclamation
+        of the old log space; a read-only store never writes anything.
+        """
+        if self._closed:
+            raise ValueError("scan cursor is closed")
+        if self._sid is None:
+            self._sid = _snapshot_id(self._items)
+        if self._publisher is not None:
+            self._publisher(self._seq, self._sid, self._items)
+        self._box = _register_snapshot(self._seq, self._sid, self._items)
+        return _encode_token(self._seq, self._sid, self._lo, self._hi,
+                             self._pos)
+
+    def mark(self) -> bytes:
+        """Alias for :meth:`token`."""
+        return self.token()
 
     @property
     def closed(self) -> bool:
@@ -189,6 +264,7 @@ class ScanCursor:
 
     def close(self) -> None:
         self._items = []
+        self._box = None
         self._closed = True
 
     def __enter__(self) -> "ScanCursor":
@@ -215,6 +291,115 @@ _OP_RANGE = "r"
 _OP_COMMIT = "c"
 _OP_BASE = "b"
 _COMMIT_OPS = (_OP_COMMIT, _OP_BASE)
+_OP_SNAP = "s"  # header frame of a pinned-snapshot sidecar
+
+# Pinned-snapshot sidecars (``wal.s<seq>.<id>``) and scan tokens. A token
+# is an opaque, platform-independent byte string: magic, the snapshot's
+# durable sequence, its 32-byte content identity, the optional range
+# endpoints, the next position and a checksum -- all integers big-endian,
+# so the same snapshot and position mint byte-identical tokens everywhere.
+_TOKEN_MAGIC = b"WST1"
+_SNAPSHOT_PREFIX = "wal.s"
+_EMPTY_SNAPSHOT_ID = hashlib.sha256(b"").digest()
+
+
+def _snapshot_image(items) -> bytes:
+    """Canonical byte image of a committed snapshot: one put frame per key.
+
+    ``items`` must already be sorted by the keys' raw UTF-8 bytes. The
+    image uses the same deterministic framing as the log, so it is
+    identical on every platform for the same snapshot.
+    """
+    return b"".join(_encode_frame(_OP_PUT, value, key=key)
+                    for key, value in items)
+
+
+def _snapshot_id(items) -> bytes:
+    """Content identity of a committed snapshot (32 raw bytes)."""
+    return hashlib.sha256(_snapshot_image(items)).digest()
+
+
+def _encode_token(seq: int, sid: bytes, lo: bytes | None,
+                  hi: bytes | None, pos: int) -> bytes:
+    """Serialise a scan position; the exact inverse of :func:`_decode_token`."""
+    flags = (1 if lo is not None else 0) | (2 if hi is not None else 0)
+    parts = [_TOKEN_MAGIC, seq.to_bytes(8, "big"), sid, bytes((flags,))]
+    for bound in (lo, hi):
+        raw = bound if bound is not None else b""
+        parts.append(len(raw).to_bytes(4, "big"))
+        parts.append(raw)
+    parts.append(pos.to_bytes(8, "big"))
+    body = b"".join(parts)
+    return body + zlib.crc32(body).to_bytes(4, "big")
+
+
+def _decode_token(tok: bytes):
+    """Parse a scan token into ``(seq, sid, lo, hi, pos)``.
+
+    Every malformation -- wrong magic, truncation, trailing garbage, a
+    checksum mismatch, unknown flags, a hidden endpoint or a reversed
+    range -- raises ``ValueError``; nothing is guessed or repaired.
+    """
+    if len(tok) < 4 + 8 + 32 + 1 + 4 + 4 + 8 + 4:
+        raise ValueError("not a scan token")
+    if tok[:4] != _TOKEN_MAGIC:
+        raise ValueError("not a scan token")
+    if int.from_bytes(tok[-4:], "big") != zlib.crc32(tok[:-4]):
+        raise ValueError("scan token checksum mismatch")
+    off = 4
+    seq = int.from_bytes(tok[off:off + 8], "big")
+    off += 8
+    sid = tok[off:off + 32]
+    off += 32
+    flags = tok[off]
+    off += 1
+    if flags & ~0x03:
+        raise ValueError("scan token carries unknown flags")
+    bounds = []
+    for present in (flags & 1, flags & 2):
+        if off + 4 > len(tok) - 4:
+            raise ValueError("scan token is truncated")
+        size = int.from_bytes(tok[off:off + 4], "big")
+        off += 4
+        if off + size > len(tok) - 4:
+            raise ValueError("scan token is truncated")
+        if not present and size != 0:
+            raise ValueError("scan token carries a hidden endpoint")
+        bounds.append(tok[off:off + size] if present else None)
+        off += size
+    if off + 8 != len(tok) - 4:
+        raise ValueError("scan token length mismatch")
+    pos = int.from_bytes(tok[off:off + 8], "big")
+    lo, hi = bounds
+    if lo is not None and hi is not None and lo > hi:
+        raise ValueError("scan token range is reversed")
+    return seq, sid, lo, hi, pos
+
+
+class _SnapshotBox:
+    """Strong box around a materialised snapshot for the process registry."""
+
+    __slots__ = ("items", "__weakref__")
+
+    def __init__(self, items):
+        self.items = items
+
+
+# (seq, snapshot id) -> _SnapshotBox, held weakly: an entry lives only
+# while some live cursor or resolver references it, so pinned history
+# never accumulates in memory. It lets a token minted in this process
+# resolve without touching disk; every other path resolves from the
+# durable files.
+_SNAPSHOTS: "weakref.WeakValueDictionary" = weakref.WeakValueDictionary()
+
+
+def _register_snapshot(seq: int, sid: bytes, items) -> _SnapshotBox:
+    key = (seq, sid)
+    box = _SNAPSHOTS.get(key)
+    if box is None:
+        box = _SnapshotBox(items)
+        _SNAPSHOTS[key] = box
+    return box
 
 # os.open defaults to the C runtime's text mode on Windows, which would
 # expand every "\n" to "\r\n" inside os.write and inflate the log on disk.
@@ -349,22 +534,23 @@ def _fsync_dir(path: str) -> None:
     (access denied); directory entries there are made durable by the file's
     own flush-on-rename, so skipping the directory fsync keeps store creation
     working everywhere. Other platforms occasionally refuse the directory
-    open or the fsync the same way (restrictive mounts, virtualised FSes);
-    that is likewise best-effort -- the file's own fsync is what carries the
-    data -- so a ``PermissionError`` at either step never aborts store
-    creation or a commit/compaction.
+    open or the fsync (restrictive mounts, virtualised FSes); that is
+    likewise best-effort -- the file's own fsync is what carries the data.
+    Any refusal, whatever ``OSError`` form it takes, is absorbed: a rejected
+    directory sync never aborts store creation, a commit or a compaction,
+    and never affects later writes.
     """
     if sys.platform == "win32":
         return
     try:
         fd = os.open(path, os.O_RDONLY)
-    except PermissionError:
+    except OSError:
         return
     try:
         try:
             os.fsync(fd)
-        except PermissionError:
-            # Some non-Windows mounts reject directory fsync the same way.
+        except OSError:
+            # Some non-Windows mounts reject directory fsync, in any form.
             pass
     finally:
         os.close(fd)
@@ -444,9 +630,12 @@ class Store:
     moment of the call, yielding ``(key, value)`` pairs in bytewise key
     order from ``start`` (inclusive) to ``end`` (exclusive); a ``None``
     endpoint leaves that side unbounded. Uncommitted session changes of a
-    writer are not part of the snapshot. The cursor reads from memory only:
-    it never touches the log, takes no lock, and is unaffected by later
-    commits, compaction, recovery or the store closing.
+    writer are not part of the snapshot, and neither are they visible to
+    ``get``: single-key reads see the last committed snapshot too. The
+    cursor reads from memory only: it never touches the log, takes no lock,
+    and is unaffected by later commits, compaction, recovery or the store
+    closing. ``scan(token=...)`` instead resumes the pinned scan a token
+    from :meth:`ScanCursor.token` belongs to, from its recorded position.
     """
 
     def __init__(self, path: str, read_only: bool = False):
@@ -700,6 +889,14 @@ class Store:
                 os.unlink(name)
             except FileNotFoundError:
                 pass
+        # Half-published snapshot sidecars left by a kill mid-token-mint.
+        for name in os.listdir(self._dir):
+            if (name.startswith(_SNAPSHOT_PREFIX)
+                    and name.endswith(".tmp")):
+                try:
+                    os.unlink(os.path.join(self._dir, name))
+                except OSError:
+                    pass
 
     def _rebuild_log(self, clean_end: int) -> None:
         """Make the log exactly its clean ``[0, clean_end)`` prefix.
@@ -1030,6 +1227,10 @@ class Store:
         self._touched = {}
         self._discarded = discarded
         self._corrupt = False
+        # Make the recovered committed snapshot resumable by token even
+        # before this session commits again (an old-version directory or a
+        # reopened store). Best-effort below the write path.
+        self._archive_current_snapshot()
 
     def _converge_on_open(self) -> None:
         """Crash cleanup at open; leave a corrupt store inert for recover()."""
@@ -1196,6 +1397,15 @@ class Store:
         self._check_key(key)
         if self._read_only:
             return self._read_key(key)
+        # A writer's single-key reads see the last committed snapshot,
+        # exactly like its scans: uncommitted session changes are
+        # invisible. ``_touched`` remembers each pending key's committed
+        # value (``None`` when it was absent), so the committed answer is
+        # one dict lookup either way -- never a log replay.
+        if not self._touched:
+            return self._data.get(key)
+        if key in self._touched:
+            return self._touched[key]
         return self._data.get(key)
 
     @staticmethod
@@ -1217,8 +1427,9 @@ class Store:
                 f"range start {start!r} sorts after range end {end!r}")
         return lo, hi
 
-    def scan(self, start: str | None = None,
-             end: str | None = None) -> ScanCursor:
+    def scan(self, start: str | None = None, end: str | None = None,
+             *, token: bytes | None = None,
+             resume: bytes | None = None) -> ScanCursor:
         """Open an ordered cursor over the pinned committed snapshot.
 
         The cursor yields ``(key, value)`` pairs in bytewise key order --
@@ -1232,6 +1443,17 @@ class Store:
         session changes are not part of the snapshot; a read-only store
         scans the snapshot it pinned at open.
 
+        With ``token`` (alias ``resume``) the call instead continues the
+        scan a :meth:`ScanCursor.token` token belongs to: the token names
+        its pinned snapshot, range and position, and the returned cursor
+        yields exactly the tail of that original scan -- in this process or
+        in a freshly opened store, across later commits, compaction, crash
+        recovery and reclamation of the old log space. Endpoints must not
+        accompany a token (the token carries its range). A token that is
+        forged, truncated, corrupted, out of range or names a snapshot this
+        store does not hold raises ``ValueError``; a non-bytes token raises
+        ``TypeError``.
+
         The snapshot is materialised once, here, so the cursor is
         independent of later commits, compaction, crash recovery and log
         space reclamation, and its cost is independent of the log's history
@@ -1239,17 +1461,217 @@ class Store:
         as does reading from the cursor after it is closed.
         """
         self._ensure_open()
+        if token is not None and resume is not None:
+            raise ValueError("pass only one scan token")
+        tok = token if token is not None else resume
+        if tok is not None:
+            if start is not None or end is not None:
+                raise ValueError(
+                    "range endpoints must not accompany a scan token")
+            return self._resume_scan(tok)
         lo, hi = self._check_range(start, end)
 
         data = self._ro_index if self._read_only else self._committed_view()
+        seq = self._ro_seq if self._read_only else self._seq
+        items = self._sorted_snapshot_items(data)
+        lo_idx, hi_idx = self._range_window(items, lo, hi)
+        return ScanCursor(items, lo_idx, hi_idx, seq=seq, lo=lo, hi=hi,
+                          publisher=self._snapshot_publisher())
+
+    # -- resumable scan tokens ---------------------------------------------
+
+    @staticmethod
+    def _sorted_snapshot_items(data) -> list:
+        """Materialise a snapshot dict as sorted ``(key, value)`` pairs."""
+        return sorted(
+            ((key, bytes(value)) for key, value in data.items()),
+            key=lambda item: item[0].encode("utf-8"))
+
+    @staticmethod
+    def _range_window(items, lo, hi) -> tuple[int, int]:
+        """Index window of the half-open bytewise range in sorted items."""
+        keys = [key.encode("utf-8") for key, _value in items]
+        lo_idx = bisect.bisect_left(keys, lo) if lo is not None else 0
+        hi_idx = (bisect.bisect_left(keys, hi) if hi is not None
+                  else len(items))
+        return lo_idx, hi_idx
+
+    def _snapshot_publisher(self):
+        """The durable-snapshot callback for cursors; ``None`` on readers."""
+        return None if self._read_only else self._publish_snapshot
+
+    def _snapshot_blob_path(self, seq: int, sid: bytes) -> str:
+        return os.path.join(
+            self._dir, f"{_SNAPSHOT_PREFIX}{seq}.{sid.hex()}")
+
+    def _publish_snapshot(self, seq: int, sid: bytes | None,
+                          items) -> None:
+        """Durably publish a pinned snapshot image for later token resumes.
+
+        The image -- a header frame carrying the sequence, then the
+        canonical put frames -- is content-addressed as
+        ``wal.s<seq>.<id>`` and atomically replaced, so republishing is a
+        no-op and a kill mid-publish leaves only a temp file the next open
+        reclaims. Writer-only: read-only stores never create files. The
+        empty initial snapshot (sequence 0) needs no file: it is the
+        well-known empty content and always reconstructible.
+        """
+        if seq == 0:
+            return
+        if sid is None:
+            sid = _snapshot_id(items)
+        path = self._snapshot_blob_path(seq, sid)
+        if os.path.exists(path):
+            return
+        blob = _encode_frame(_OP_SNAP, seq=seq) + _snapshot_image(items)
+
+        def write(f):
+            f.write(blob)
+
+        self._atomic_file(path, write)
+
+    def _archive_current_snapshot(self) -> None:
+        """Publish the current committed snapshot's sidecar if missing."""
+        if self._seq == 0:
+            # The empty initial snapshot needs no file: it is always
+            # reconstructible from its well-known content identity.
+            return
+        self._publish_snapshot(self._seq, None,
+                               self._sorted_snapshot_items(self._data))
+
+    def _read_snapshot_blob(self, seq: int, sid: bytes):
+        """Load and verify a published snapshot sidecar; ``None`` if absent.
+
+        The blob must be a clean frame sequence: one snapshot header with
+        the token's sequence, then put frames with strictly increasing keys
+        whose canonical image hashes to the token's identity. A damaged or
+        mismatched sidecar is corruption of the snapshot machinery, never
+        silently skipped.
+        """
+        path = self._snapshot_blob_path(seq, sid)
+        try:
+            with open(path, "rb") as f:
+                raw = f.read()
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise CorruptLogError(f"snapshot sidecar is unreadable: {exc}")
+        frames, terminal = self._scan_bytes(raw)
+        if terminal is not None or not frames:
+            raise CorruptLogError("snapshot sidecar is not a clean image")
+        head = frames[0][0]
+        if head.get("t") != _OP_SNAP or head.get("s") != seq:
+            raise CorruptLogError(
+                "snapshot sidecar does not match its name")
         items = []
-        for key, value in data.items():
-            key_bytes = key.encode("utf-8")
-            if not _key_in_range(key_bytes, lo, hi):
+        last_key = None
+        for meta, value, _start, _end in frames[1:]:
+            key = meta.get("k")
+            if (meta.get("t") != _OP_PUT or not isinstance(key, str)
+                    or key == ""):
+                raise CorruptLogError("snapshot sidecar holds a non-put frame")
+            if last_key is not None and key <= last_key:
+                raise CorruptLogError("snapshot sidecar keys are not sorted")
+            items.append((key, value))
+            last_key = key
+        if _snapshot_id(items) != sid:
+            raise CorruptLogError("snapshot sidecar fails its identity check")
+        return items
+
+    def _snapshot_from_logs(self, seq: int, sid: bytes):
+        """Reconstruct the committed snapshot at ``seq`` from durable files.
+
+        Replays only the committed prefix ending at the commit (or base)
+        marker carrying ``seq`` -- never uncommitted bytes, never anything
+        past the pinned point -- from ``wal.log`` or ``wal.ckp``. Returns
+        the sorted items when the reconstructed snapshot's identity matches
+        ``sid``, else ``None``.
+        """
+        if seq < 1:
+            return None
+        for path in (self._path, self._ckp_path):
+            try:
+                frames, _terminal = self._read_log(path)
+            except (FileNotFoundError, OSError):
                 continue
-            items.append((key_bytes, key, bytes(value)))
-        items.sort(key=lambda item: item[0])
-        return ScanCursor([(key, value) for _kb, key, value in items])
+            state: dict[str, bytes] = {}
+            for meta, value, _start, _end in frames:
+                op = meta.get("t")
+                if op in _COMMIT_OPS:
+                    marker_seq = meta.get("s")
+                    if not isinstance(marker_seq, int):
+                        break
+                    if marker_seq >= seq:
+                        if marker_seq == seq:
+                            items = self._sorted_snapshot_items(state)
+                            if _snapshot_id(items) == sid:
+                                return items
+                        break
+                    continue
+                if op == _OP_PUT:
+                    key = meta.get("k")
+                    if not isinstance(key, str):
+                        break
+                    state[key] = value
+                elif op == _OP_DELETE:
+                    key = meta.get("k")
+                    if not isinstance(key, str):
+                        break
+                    state.pop(key, None)
+                elif op == _OP_RANGE:
+                    try:
+                        lo, hi = _range_bounds_from_meta(meta)
+                    except CorruptLogError:
+                        break
+                    for key in [k for k in state
+                                if _key_in_range(k.encode("utf-8"), lo, hi)]:
+                        del state[key]
+                else:
+                    break
+        return None
+
+    def _resolve_token_snapshot(self, seq: int, sid: bytes) -> list:
+        """Find the pinned snapshot a token names, or raise ``ValueError``.
+
+        Resolution order: the process-wide registry of live snapshots, this
+        store's own committed state, the durable ``wal.s`` sidecar a writer
+        published when the token was minted, and the committed prefix of
+        the log or checkpoint. The empty initial snapshot (sequence 0) is
+        always reconstructible. Anything else is a forged, stale or foreign
+        token and is rejected without guessing.
+        """
+        box = _SNAPSHOTS.get((seq, sid))
+        if box is not None:
+            return box.items
+        cur_seq = self._ro_seq if self._read_only else self._seq
+        if cur_seq == seq:
+            data = (self._ro_index if self._read_only
+                    else self._committed_view())
+            items = self._sorted_snapshot_items(data)
+            if _snapshot_id(items) == sid:
+                return items
+        items = self._read_snapshot_blob(seq, sid)
+        if items is not None:
+            return items
+        items = self._snapshot_from_logs(seq, sid)
+        if items is not None:
+            return items
+        if seq == 0 and sid == _EMPTY_SNAPSHOT_ID:
+            return []
+        raise ValueError(
+            "scan token does not match any snapshot of this store")
+
+    def _resume_scan(self, tok) -> ScanCursor:
+        """Open a cursor continuing the scan ``tok`` was minted from."""
+        if not isinstance(tok, (bytes, bytearray, memoryview)):
+            raise TypeError("scan token must be bytes")
+        seq, sid, lo, hi, pos = _decode_token(bytes(tok))
+        items = self._resolve_token_snapshot(seq, sid)
+        lo_idx, hi_idx = self._range_window(items, lo, hi)
+        if not lo_idx <= pos <= hi_idx:
+            raise ValueError("scan token position is out of range")
+        return ScanCursor(items, lo_idx, hi_idx, pos=pos, seq=seq, lo=lo,
+                          hi=hi, publisher=self._snapshot_publisher())
 
     def delete(self, key: str | None, end: str | None = None) -> None:
         """Delete one key, or a half-open byte range when ``end`` is given.
@@ -1311,9 +1733,12 @@ class Store:
 
     def commit(self) -> int:
         self._ensure_writable()
-        if self._pending == 0:
-            return self._seq
-        _write_all(self._fd, _encode_frame(_OP_COMMIT, seq=self._seq + 1))
+        # Every commit advances the durable sequence by exactly one and
+        # writes its marker, even a commit with no pending changes: the
+        # durable boundary is always "previous sequence + 1", with no
+        # separate empty-commit rule.
+        new_seq = self._seq + 1
+        _write_all(self._fd, _encode_frame(_OP_COMMIT, seq=new_seq))
         os.fsync(self._fd)
 
         # The commit frame is durable first, so even a kill here leaves a
@@ -1322,11 +1747,19 @@ class Store:
         clean_end = os.fstat(self._fd).st_size
         self._write_checkpoint(clean_end)
         had_marker = os.path.exists(self._marker_path)
-        self._seq += 1
+        self._seq = new_seq
         self._pending = 0
         self._touched = {}
         self._entries += 1
         self._discarded = 0
+        # Archive the complete committed snapshot under its sequence and
+        # content identity, so a scan token minted against it -- even by a
+        # separate read-only process -- keeps resuming after later commits,
+        # compaction and reclamation. Content-addressed and atomic, so a
+        # repeated publish is a no-op and a kill leaves only a reclaimed
+        # temp file.
+        self._publish_snapshot(self._seq, None,
+                               self._sorted_snapshot_items(self._data))
         if had_marker:
             self._remove_marker()
         return self._seq

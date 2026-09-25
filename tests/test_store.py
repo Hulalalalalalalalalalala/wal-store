@@ -75,8 +75,11 @@ class BasicOperationsTest(StoreBase):
         with Store(self.dir) as s:
             s.put("a", b"1")
             s.put("b", b"two")
-            self.assertEqual(s.get("a"), b"1")
+            # Uncommitted puts are invisible to single-key reads too: both
+            # answer from the last committed (here empty) snapshot.
+            self.assertIsNone(s.get("a"))
             self.assertEqual(s.commit(), 1)
+            self.assertEqual(s.get("a"), b"1")
             self.assertEqual(s.get("b"), b"two")
 
         with self.reopen() as s:
@@ -119,15 +122,18 @@ class BasicOperationsTest(StoreBase):
         with Store(self.dir) as s:
             self.assertIsNone(s.get("nope"))
 
-    def test_commit_without_pending_returns_seq(self):
+    def test_commit_always_advances_sequence_by_one(self):
+        # Every commit() writes a marker and advances by exactly one, even
+        # with no pending changes; there is no separate empty-commit rule.
         with Store(self.dir) as s:
-            self.assertEqual(s.commit(), 0)
+            self.assertEqual(s.commit(), 1)
             s.put("k", b"v")
-            s.commit()
-            self.assertEqual(s.commit(), 1)
-            self.assertEqual(s.commit(), 1)
+            self.assertEqual(s.commit(), 2)
+            self.assertEqual(s.commit(), 3)
+            self.assertEqual(s.commit(), 4)
         with self.reopen() as s:
-            self.assertEqual(s.commit(), 1)
+            self.assertEqual(s.stats()["seq"], 4)
+            self.assertEqual(s.commit(), 5)
 
     def test_stats(self):
         with Store(self.dir) as s:
@@ -499,7 +505,7 @@ class RecoveryTest(StoreBase):
             self.assertEqual(s.commit(), 3)
         with self.reopen() as s:
             self.assertEqual(s.stats()["seq"], 3)
-            self.assertEqual(s.commit(), 3)
+            self.assertEqual(s.commit(), 4)
 
     def test_stats_ignore_torn_and_uncommitted_tail(self):
         with Store(self.dir) as s:
