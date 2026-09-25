@@ -132,8 +132,11 @@ so a sweep killed mid-run simply completes on reopen):
   it lists the snapshots that process has in use with a heartbeat, and the
   writer reads every lease before removing a copy (re-reading them
   immediately before each unlink, so a lease taken mid-sweep still
-  protects its copy). An orderly close removes the lease; a process killed
-  without closing stops heartbeating, and after the lease TTL its lease
+  protects its copy). Read-only stores register one at open; cursors and
+  resumed scans register one on writer and read-only stores alike. An
+  orderly close removes the lease; a process killed without closing stops
+  heartbeating, and once its heartbeat is older than the lease TTL — or
+  the process named in the lease is no longer running at all — its lease
   pins nothing and is swept. An in-use token keeps pointing at the same
   snapshot across commits, compactions and crash recovery; resuming it is
   byte-for-byte the tail of the original one-shot scan. Reclamation
@@ -144,10 +147,21 @@ so a sweep killed mid-run simply completes on reopen):
 - **Everything else** — copies outside the retention window with no user
   (no in-process pin and no fresh lease in any process) are deleted.
 
+A copy's name carries its content identity, and the copy is trusted only
+while its content matches: at open, when a resume selects a copy, when
+the writer decides whether an existing copy is usable and before
+reclamation removes one, the copy's bytes are verified against the
+identity in its name. A copy whose content does not match is damaged —
+its bytes are never handed to a caller, nothing is guessed from them and
+the file is never repaired in place. The snapshot is rebuilt from the
+committed log prefix or the checkpoint instead, serving reads and resumes
+byte-identical to a one-shot scan; a fresh publish atomically replaces
+the damaged file and reclamation sweeps it like any other dead copy.
+
 A copy disappearing does not by itself invalidate a token: the token
 keeps working for as long as that snapshot can still be rebuilt from the
-committed log prefix or the checkpoint. Only once every copy is gone and
-neither the surviving log prefix nor the checkpoint can rebuild the
+committed log prefix or the checkpoint. Only once no usable copy remains
+and neither the surviving log prefix nor the checkpoint can rebuild the
 snapshot does resuming an old token raise `ValueError`. Forged,
 truncated, corrupted, out-of-range or cross-snapshot tokens raise
 `ValueError` just as before; the store never guesses or repairs them.

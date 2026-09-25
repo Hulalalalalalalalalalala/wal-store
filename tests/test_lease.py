@@ -13,10 +13,13 @@ process:
 * the writer re-reading the leases before every unlink and never removing
   a copy a fresh lease names, while a stale, malformed or foreign lease
   neither protects anything nor breaks the sweep;
+* a lease expiring not only when its heartbeat goes stale but also when
+  the process named in its file name is no longer running;
 * files whose name is not a legal lease sidecar being ignored entirely --
   never parsed, never deleted;
 * a reader in a read-only directory working with no lease and no error;
-* a writer itself never creating a lease sidecar.
+* a writer that holds no cursor or resume session never creating a lease
+  sidecar.
 """
 
 import base64
@@ -265,7 +268,11 @@ class CrossProcessLeaseTest(LeaseBase):
 
 
 class LeaseContentTest(LeaseBase):
-    def _write_fake_lease(self, seq, sid, ts, pid=999999, raw=None):
+    def _write_fake_lease(self, seq, sid, ts, pid=None, raw=None):
+        # Default to this (live) process as the owner: a lease whose owner
+        # is not running expires on the spot regardless of its heartbeat.
+        if pid is None:
+            pid = os.getpid()
         name = "%s%d.%s" % (_LEASE_PREFIX, pid, "ab" * 16)
         path = os.path.join(self.dir, name)
         if raw is None:
@@ -292,6 +299,21 @@ class LeaseContentTest(LeaseBase):
             copy = [n for n in os.listdir(self.dir) if n.startswith("wal.s1.")][0]
             sid = bytes.fromhex(copy.split(".")[2])
         self._write_fake_lease(1, sid, time.time() - _LEASE_TTL - 10)
+        self.advance_past_retention()
+        self.assertFalse(self.old_copy_present())
+        self.assertEqual(_lease_names(self.dir), [])
+
+    def test_lease_from_dead_process_does_not_protect(self):
+        with self.writer() as s:
+            s.put("old", b"o")
+            s.commit()
+            copy = [n for n in os.listdir(self.dir) if n.startswith("wal.s1.")][0]
+            sid = bytes.fromhex(copy.split(".")[2])
+        # The owner process has already exited: its lease is expired no
+        # matter how fresh the heartbeat timestamp looks.
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        self._write_fake_lease(1, sid, time.time(), pid=dead.pid)
         self.advance_past_retention()
         self.assertFalse(self.old_copy_present())
         self.assertEqual(_lease_names(self.dir), [])
