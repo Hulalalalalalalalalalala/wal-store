@@ -68,8 +68,30 @@ checkpoint. Deleted keys -- including keys covered by range tombstones
 that compaction has since reclaimed -- never reappear: the resumed stream
 is always exactly the pinned snapshot. A token that is forged, truncated,
 corrupted, out of range or names a snapshot the store does not hold raises
-``ValueError`` with no guessing or repair; the token bytes are
-platform-independent and identical for the same snapshot and position.
+``ValueError`` with no guessing or repair; only genuine ``bytes`` are
+accepted (a ``bytearray`` or ``memoryview`` raises ``TypeError``), and the
+token bytes are platform-independent and identical for the same snapshot
+and position.
+
+Published snapshot copies have a lifecycle of their own, so the store
+directory does not grow one permanent copy per minted token. Reclamation
+runs after every commit and every compaction and is finished at every
+writer open. A copy survives while it is *in use* -- an open cursor, or a
+live read-only store in this process, is serving that snapshot -- and the
+current committed snapshot together with the newest three published
+predecessor generations are always retained; every other copy is removed.
+The pin set is process-wide and weak, so a writer and the read-only
+stores (or cursors) in the same process share one notion of "in use", and
+a cursor dropped without ``close()`` releases its pin when it is garbage
+collected. Reclamation deletes only redundant copies, never the log, the
+checkpoint or a record, and changes neither the durable sequence nor the
+committed state; the sweep is a set of independent unlinks followed by a
+directory sync, so a kill at any point and a reopen converges to the same
+file set. Losing a copy does not invalidate its token while the snapshot
+can still be rebuilt from the log prefix or the checkpoint; only once no
+copy remains and neither durable source can rebuild it does an old token
+stop resolving (``ValueError``).
+
 
 Range deletes (``Store.delete_range(start, end)``, or ``delete(start,
 end)``) use the very same endpoints and half-open bytewise convention as
@@ -197,7 +219,7 @@ class ScanCursor:
     """
 
     def __init__(self, items, lo_idx=0, hi_idx=None, pos=None, seq=0,
-                 lo=None, hi=None, publisher=None):
+                 lo=None, hi=None, publisher=None, sid=None):
         # ``items`` is the materialised snapshot: (key, value) pairs already
         # sorted by the keys' raw UTF-8 bytes. The visible window is
         # [lo_idx, hi_idx) and the next position starts at ``pos``.
@@ -212,8 +234,13 @@ class ScanCursor:
         # minted token survives compaction and reclamation; ``None`` on
         # read-only stores, which never create or modify any file.
         self._publisher = publisher
-        self._sid = None
-        self._box = None
+        self._sid = sid
+        # An open cursor counts as a user of its snapshot for the
+        # reclamation rules: its box keeps the snapshot's pin alive in the
+        # process-wide pin set until ``close()`` (or destruction), so
+        # reclamation never removes the copy an open cursor is over. The
+        # content identity is derived lazily on the first token mint.
+        self._box = _register_snapshot(seq, items, sid)
         self._closed = False
 
     def __iter__(self) -> "ScanCursor":
@@ -248,9 +275,11 @@ class ScanCursor:
             raise ValueError("scan cursor is closed")
         if self._sid is None:
             self._sid = _snapshot_id(self._items)
+            # Share the derived identity with the pin box so the in-use
+            # check at reclamation never hashes this snapshot again.
+            self._box._sid = self._sid
         if self._publisher is not None:
             self._publisher(self._seq, self._sid, self._items)
-        self._box = _register_snapshot(self._seq, self._sid, self._items)
         return _encode_token(self._seq, self._sid, self._lo, self._hi,
                              self._pos)
 
@@ -263,6 +292,9 @@ class ScanCursor:
         return self._closed
 
     def close(self) -> None:
+        if self._closed:
+            return
+        _unpin_snapshot(self._box)
         self._items = []
         self._box = None
         self._closed = True
@@ -301,6 +333,10 @@ _OP_SNAP = "s"  # header frame of a pinned-snapshot sidecar
 _TOKEN_MAGIC = b"WST1"
 _SNAPSHOT_PREFIX = "wal.s"
 _EMPTY_SNAPSHOT_ID = hashlib.sha256(b"").digest()
+# Besides the snapshot the store is currently committed at, the newest this
+# many published snapshot copies are always retained; older copies are
+# reclaimed once nothing is using them.
+_SNAPSHOT_RETENTION = 3
 
 
 def _snapshot_image(items) -> bytes:
@@ -377,29 +413,68 @@ def _decode_token(tok: bytes):
 
 
 class _SnapshotBox:
-    """Strong box around a materialised snapshot for the process registry."""
+    """Strong box around one user's materialised, pinned snapshot.
 
-    __slots__ = ("items", "__weakref__")
+    A box is the unit the reclamation logic counts as a user: every open
+    cursor and every read-only store holds its own box for the snapshot it
+    serves. Boxes live in a process-wide :class:`weakref.WeakSet`, so a
+    cursor or reader that is garbage collected without an explicit
+    ``close()`` releases its pin automatically -- the in-use table can
+    neither leak nor outlive the snapshots it protects. The content
+    identity is hashed lazily, so merely opening a scan that never mints a
+    token pays no hashing cost.
+    """
 
-    def __init__(self, items):
+    __slots__ = ("seq", "items", "_sid", "__weakref__")
+
+    def __init__(self, seq, items, sid=None):
+        self.seq = seq
         self.items = items
+        self._sid = sid
+
+    def sid(self) -> bytes:
+        if self._sid is None:
+            self._sid = _snapshot_id(self.items)
+        return self._sid
 
 
-# (seq, snapshot id) -> _SnapshotBox, held weakly: an entry lives only
-# while some live cursor or resolver references it, so pinned history
-# never accumulates in memory. It lets a token minted in this process
-# resolve without touching disk; every other path resolves from the
-# durable files.
-_SNAPSHOTS: "weakref.WeakValueDictionary" = weakref.WeakValueDictionary()
+# Process-wide set of snapshots currently in use. Every open cursor and
+# every live read-only store keeps a box here for its pinned snapshot; the
+# writer's reclamation never removes the published copy of any snapshot
+# named in this set. The set is weak, so users closed normally (or simply
+# dropped) release their pin with no bookkeeping. The boxes also keep the
+# materialised bytes alive in memory, so a token minted in this process
+# resolves without touching disk even across stores.
+_PINS: "weakref.WeakSet" = weakref.WeakSet()
 
 
-def _register_snapshot(seq: int, sid: bytes, items) -> _SnapshotBox:
-    key = (seq, sid)
-    box = _SNAPSHOTS.get(key)
-    if box is None:
-        box = _SnapshotBox(items)
-        _SNAPSHOTS[key] = box
+def _register_snapshot(seq: int, items, sid=None) -> _SnapshotBox:
+    """Register one user (a cursor or a reader) pinning a snapshot."""
+    box = _SnapshotBox(seq, items, sid)
+    _PINS.add(box)
     return box
+
+
+def _unpin_snapshot(box: _SnapshotBox) -> None:
+    """Release the pin held by a closing cursor or reader."""
+    _PINS.discard(box)
+
+
+def _live_snapshot_keys() -> set:
+    """The ``(seq, sid)`` pairs with at least one user in this process."""
+    return {(box.seq, box.sid()) for box in _PINS}
+
+
+def _pinned_snapshot(seq: int, sid: bytes):
+    """Materialised items for a live in-process pin, or ``None``.
+
+    The identity is compared only for boxes already on the token's
+    sequence, so a resolution against an unpinned sequence hashes nothing.
+    """
+    for box in _PINS:
+        if box.seq == seq and box.sid() == sid:
+            return box.items
+    return None
 
 # os.open defaults to the C runtime's text mode on Windows, which would
 # expand every "\n" to "\r\n" inside os.write and inflate the log on disk.
@@ -660,6 +735,10 @@ class Store:
         self._pending = 0
         self._closed = False
         self._corrupt = False
+        # Read-only stores pin their open-time snapshot in the process-wide
+        # pin table; writers do not pin (the current snapshot is retained by
+        # the retention rule itself), so this stays ``None`` on a writer.
+        self._pin_box = None
         # Committed value of each key this session has touched since the
         # last commit (None when the key was absent); lets a scan pin the
         # committed snapshot without replaying the log.
@@ -1231,6 +1310,9 @@ class Store:
         # before this session commits again (an old-version directory or a
         # reopened store). Best-effort below the write path.
         self._archive_current_snapshot()
+        # Finish any reclamation a previous commit/compaction (or its kill)
+        # left, converging the historical-copy set at every open.
+        self._reclaim_snapshots()
 
     def _converge_on_open(self) -> None:
         """Crash cleanup at open; leave a corrupt store inert for recover()."""
@@ -1266,6 +1348,11 @@ class Store:
         self._ro_seq = seq
         self._ro_entries = len(frames)
         self._ro_bytes = end
+        # A live reader counts as a user of the snapshot it pinned: its box
+        # stays in the process-wide pin set until the reader closes, so the
+        # writer's reclamation never removes that snapshot's copy.
+        self._pin_box = _register_snapshot(
+            seq, self._sorted_snapshot_items(state))
 
     def _choose_readonly_prefix(self):
         """Return ``(frames, end, seq)`` for the highest committed snapshot.
@@ -1539,6 +1626,69 @@ class Store:
         self._publish_snapshot(self._seq, None,
                                self._sorted_snapshot_items(self._data))
 
+    # -- historical-copy reclamation --------------------------------------
+
+    def _parse_snapshot_name(self, name: str):
+        """Parse a ``wal.s<seq>.<id>`` sidecar name; ``None`` if not one."""
+        if not name.startswith(_SNAPSHOT_PREFIX):
+            return None
+        stem = name[len(_SNAPSHOT_PREFIX):]
+        dot = stem.find(".")
+        if dot <= 0:
+            return None
+        try:
+            seq = int(stem[:dot])
+            sid = bytes.fromhex(stem[dot + 1:])
+        except ValueError:
+            return None
+        if seq < 1 or len(sid) != 32:
+            return None
+        return seq, sid
+
+    def _reclaim_snapshots(self) -> None:
+        """Reclaim published snapshot copies that are neither used nor kept.
+
+        A copy is kept when it is the current committed snapshot, when it
+        belongs to the newest ``_SNAPSHOT_RETENTION`` generations with a
+        published copy, or when it is in use: an open cursor or a live
+        read-only store in this process pins it. Every other
+        ``wal.s<seq>.<id>`` sidecar is removed. Only redundant copies are
+        deleted -- the log prefix and the checkpoint are untouched -- so
+        ongoing reads and resumed scans do not change by a byte.
+
+        The scan is idempotent and kill-safe: each unlink is independent,
+        re-running reaches the same set of files, and a run killed at any
+        unlink is simply finished on the next open; malformed sidecar names
+        are ignored rather than treated as files to delete.
+        """
+        copies = []  # (seq, sid, name)
+        try:
+            names = os.listdir(self._dir)
+        except FileNotFoundError:
+            return
+        for name in names:
+            parsed = self._parse_snapshot_name(name)
+            if parsed is not None:
+                copies.append((parsed[0], parsed[1], name))
+        # Retain the current committed snapshot and the three newest
+        # generations that precede it; older generations are reclaimed
+        # unless a user in this process has them open.
+        predecessors = sorted({seq for seq, _sid, _n in copies
+                               if seq != self._seq}, reverse=True)
+        kept_seqs = {self._seq, *predecessors[:_SNAPSHOT_RETENTION]}
+        live = _live_snapshot_keys()
+        removed = False
+        for seq, sid, name in copies:
+            if seq == self._seq or seq in kept_seqs or (seq, sid) in live:
+                continue
+            try:
+                os.unlink(os.path.join(self._dir, name))
+            except FileNotFoundError:
+                continue
+            removed = True
+        if removed:
+            _fsync_dir(self._dir)
+
     def _read_snapshot_blob(self, seq: int, sid: bytes):
         """Load and verify a published snapshot sidecar; ``None`` if absent.
 
@@ -1640,9 +1790,9 @@ class Store:
         always reconstructible. Anything else is a forged, stale or foreign
         token and is rejected without guessing.
         """
-        box = _SNAPSHOTS.get((seq, sid))
-        if box is not None:
-            return box.items
+        items = _pinned_snapshot(seq, sid)
+        if items is not None:
+            return items
         cur_seq = self._ro_seq if self._read_only else self._seq
         if cur_seq == seq:
             data = (self._ro_index if self._read_only
@@ -1663,15 +1813,19 @@ class Store:
 
     def _resume_scan(self, tok) -> ScanCursor:
         """Open a cursor continuing the scan ``tok`` was minted from."""
-        if not isinstance(tok, (bytes, bytearray, memoryview)):
+        if not isinstance(tok, bytes):
+            # Only genuine bytes are accepted; a convertible stand-in
+            # (bytearray, memoryview, str, ...) is rejected rather than
+            # coerced.
             raise TypeError("scan token must be bytes")
-        seq, sid, lo, hi, pos = _decode_token(bytes(tok))
+        seq, sid, lo, hi, pos = _decode_token(tok)
         items = self._resolve_token_snapshot(seq, sid)
         lo_idx, hi_idx = self._range_window(items, lo, hi)
         if not lo_idx <= pos <= hi_idx:
             raise ValueError("scan token position is out of range")
         return ScanCursor(items, lo_idx, hi_idx, pos=pos, seq=seq, lo=lo,
-                          hi=hi, publisher=self._snapshot_publisher())
+                          hi=hi, publisher=self._snapshot_publisher(),
+                          sid=sid)
 
     def delete(self, key: str | None, end: str | None = None) -> None:
         """Delete one key, or a half-open byte range when ``end`` is given.
@@ -1762,6 +1916,10 @@ class Store:
                                self._sorted_snapshot_items(self._data))
         if had_marker:
             self._remove_marker()
+        # Reclaim historical copies now that the new committed snapshot is
+        # durably published: only the current one, the newest three
+        # generations and copies currently in use survive.
+        self._reclaim_snapshots()
         return self._seq
 
     def recover(self) -> dict:
@@ -1798,6 +1956,10 @@ class Store:
         self._touched = {}
         self._discarded = discarded
         self._corrupt = False
+        # Converge the historical-copy set as an open does; the report is
+        # unaffected because reclamation deletes only redundant copies.
+        self._archive_current_snapshot()
+        self._reclaim_snapshots()
         return {"applied": applied, "discarded": discarded, "seq": seq}
 
     def compact(self) -> dict:
@@ -1843,6 +2005,11 @@ class Store:
         image, live = self._build_compact_image(seq)
         self._write_compact_candidate(image)
         self._install_compaction(image, seq)
+        # The old log space is gone; make sure the surviving committed
+        # snapshot is published as a copy, then run the same reclamation a
+        # commit performs so dead historical copies do not accumulate here.
+        self._archive_current_snapshot()
+        self._reclaim_snapshots()
 
         self._entries = 0 if seq == 0 else live + 1
         self._pending = 0
@@ -1875,6 +2042,9 @@ class Store:
     def close(self) -> None:
         if self._closed:
             return
+        if self._read_only and self._pin_box is not None:
+            _unpin_snapshot(self._pin_box)
+            self._pin_box = None
         if not self._read_only:
             os.close(self._fd)
         self._closed = True

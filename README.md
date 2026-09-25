@@ -106,10 +106,49 @@ corrupted (checksum mismatch), carrying an out-of-range position, naming a
 reversed range, or referring to a snapshot this store does not hold (a
 foreign store, or a snapshot whose every copy has been reclaimed) raises
 `ValueError`; nothing is guessed or repaired. A non-`bytes` token raises
-`TypeError`. The token format is platform-independent: the same snapshot at
+`TypeError` — `bytearray` and `memoryview` are not accepted and are never
+coerced. The token format is platform-independent: the same snapshot at
 the same position always mints byte-identical tokens on Windows and Linux
-(all integers are big-endian and no bytes are translated), so tokens can be
-handed across platforms and processes.
+(all integers are big-endian and no bytes are translated), so tokens can
+be handed across platforms and processes.
+
+
+## Historical snapshot lifecycle
+
+Minting a token publishes one immutable `wal.s<seq>.<id>` snapshot copy;
+without lifecycle management those copies pile up forever, one per
+minted snapshot. Reclamation fixes which copies survive and runs after
+every commit and every compaction (and is finished at every writer open,
+so a sweep killed mid-run simply completes on reopen):
+
+- **In use** — a copy is never reclaimed while any open cursor (including
+  one merely iterating, with no token minted) or any live read-only store
+  is serving that snapshot. An in-use token keeps pointing at the same
+  snapshot across commits, compactions and crash recovery; resuming it is
+  byte-for-byte the tail of the original one-shot scan. Reclamation
+  deletes only redundant copies — the reads and resumes in flight do not
+  change by a byte, and a deleted key never comes back.
+- **Always retained** — the current committed snapshot and the newest
+  three published predecessor generations are never reclaimed.
+- **Everything else** — copies outside the retention window with no user
+  are deleted.
+
+A copy disappearing does not by itself invalidate a token: the token
+keeps working for as long as that snapshot can still be rebuilt from the
+committed log prefix or the checkpoint. Only once every copy is gone and
+neither the surviving log prefix nor the checkpoint can rebuild the
+snapshot does resuming an old token raise `ValueError`. Forged,
+truncated, corrupted, out-of-range or cross-snapshot tokens raise
+`ValueError` just as before; the store never guesses or repairs them.
+
+Reclamation is an idempotent convergence: independent file unlinks with
+a directory sync at the end, so a kill at any point leaves a state the
+next open converges to the identical file set. It cannot delete an
+in-use copy, cannot move the durable sequence or the committed state,
+and never touches `wal.log`, `wal.ckp` or any record; it removes only
+dead `wal.s<seq>.<id>` copies. It adds no command-line subcommand and no
+new files: everything lives in the same store directory behind the
+existing `scan`/token calls.
 
 
 ## Range deletes
