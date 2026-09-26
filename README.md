@@ -127,7 +127,9 @@ so a sweep killed mid-run simply completes on reopen):
 - **In use** — a copy is never reclaimed while any open cursor (including
   one merely iterating, with no token minted), any live read-only store or
   any resumed scan is serving that snapshot, in this process or in *any
-  other process*. Cross-process users register a short-lived lease sidecar
+  other process*. Every cursor and resume session — on a writer or a
+  read-only store alike — and every read-only store registers a
+  short-lived lease sidecar
   (`wal.lease.<pid>.<rand>`, the only kind of file a reader ever writes):
   it lists the snapshots that process has in use with a heartbeat, and the
   writer reads every lease before removing a copy (re-reading them
@@ -151,6 +153,22 @@ neither the surviving log prefix nor the checkpoint can rebuild the
 snapshot does resuming an old token raise `ValueError`. Forged,
 truncated, corrupted, out-of-range or cross-snapshot tokens raise
 `ValueError` just as before; the store never guesses or repairs them.
+
+A copy's name carries its content identity, and the name is never taken
+on faith: at writer open, when a token is resumed and whenever the writer
+decides a copy is usable, the file's actual content is checked against
+that identity. A copy whose content does not match is damaged — it is
+never trusted as a source, never guessed and never repaired in place, and
+it changes no committed content and no key any read returns. Reads and
+resumed scans rebuild the pinned snapshot from the committed log prefix
+or the checkpoint instead, so the result is byte-for-byte identical to a
+resume served by an intact copy; only when the copy, the log prefix and
+the checkpoint can none of them rebuild the snapshot does an old token
+raise `ValueError`. The writer reclaims a damaged copy like any dead one
+(and atomically replaces the current snapshot's copy when republishing),
+so publishing and replacing copies stays atomic and kill-safe: a kill at
+any point and a reopen converge to the same copy set and the same in-use
+snapshots.
 
 Reclamation is an idempotent convergence: independent file unlinks with
 a directory sync at the end, so a kill at any point leaves a state the

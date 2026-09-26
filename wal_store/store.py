@@ -86,7 +86,8 @@ in the same process share one notion of "in use", and a cursor dropped
 without ``close()`` releases its pin when it is garbage collected.
 
 The in-process pin set cannot see users in other processes, so every
-read-only store, cursor and resume session additionally registers a
+read-only store and every cursor and resume session -- on a writer or a
+read-only store alike -- additionally registers a
 short-lived *lease* -- the one kind of sidecar a reader is allowed to
 write, named ``wal.lease.<pid>.<rand>`` -- listing the snapshots that
 process has in use with a heartbeat. The writer reads all lease sidecars
@@ -109,6 +110,21 @@ Losing a copy does not invalidate its token while the snapshot can still
 be rebuilt from the log prefix or the checkpoint; only once no copy
 remains and neither durable source can rebuild it does an old token stop
 resolving (``ValueError``).
+
+A copy's name carries its content identity, and the name is never taken on
+faith: at writer open, when a token is resumed and whenever the writer
+decides a copy is usable, the file's actual content is checked against
+that identity. A copy whose content does not match is damaged -- it is
+never trusted as a source, never guessed from and never repaired in place,
+and its presence changes no committed content and no read key. Reads and
+resumed scans instead rebuild the pinned snapshot from the committed log
+prefix or the checkpoint, so the resolved snapshot is byte-for-byte
+identical to one served by an intact copy; only when the copy, the log
+prefix and the checkpoint can none of them rebuild it does an old token
+raise ``ValueError``. The writer reclaims a damaged copy like any dead
+one, and publishing or replacing a copy stays atomic and kill-safe, so a
+kill at any point and a reopen converge to the same copy set and the same
+in-use snapshots.
 
 
 Range deletes (``Store.delete_range(start, end)``, or ``delete(start,
@@ -267,23 +283,27 @@ class ScanCursor:
         # reclamation never removes the copy an open cursor is over. The
         # content identity is derived lazily on the first token mint.
         self._box = _register_snapshot(seq, items, sid)
-        # On a read-only store the cursor additionally holds a cross-process
-        # lease for its pinned snapshot (``leases`` is the store's lease
-        # registry), so a writer in another process treats it as in use. The
-        # identity is already known there. A writer cursor passes no lease
-        # registry: its pin is visible to the reclaimer directly in-process.
+        # Every cursor -- opened on a writer or on a read-only store --
+        # additionally holds a cross-process lease for its pinned snapshot
+        # (``leases`` is the store's lease registry), so a writer in any
+        # process treats it as in use. A writer cursor is handed no identity
+        # (it is otherwise derived lazily), so it is derived here: the lease
+        # is registered from the moment the cursor opens, exactly like a
+        # read-only cursor's.
         self._leases = leases
         self._lease_held = False
         self._lease_finalizer = None
         # Only a snapshot that actually has a published copy (seq >= 1) can
         # need cross-process protection.
-        if leases is not None and sid is not None and seq >= 1:
-            leases.acquire(seq, sid)
+        if leases is not None and seq >= 1:
+            if self._sid is None:
+                self._sid = self._box.sid()
+            leases.acquire(seq, self._sid)
             self._lease_held = True
             # A cursor dropped without close() must release its lease the way
             # its weak in-process pin releases on GC.
             self._lease_finalizer = weakref.finalize(
-                self, _release_lease, leases, seq, sid)
+                self, _release_lease, leases, seq, self._sid)
         self._closed = False
 
     def __iter__(self) -> "ScanCursor":
@@ -1193,8 +1213,10 @@ class Store:
         self._pin_box = None
         # Cross-process lease registry for this directory, shared by every
         # store on it in this process. A read-only store acquires a lease for
-        # its open-time snapshot (and its cursors acquire theirs); a writer
-        # only reads and prunes it and never registers itself.
+        # its open-time snapshot, and cursors and resume sessions acquire
+        # theirs on either open form; a writer store itself never registers
+        # (its current snapshot is protected by the retention rule) and
+        # otherwise only reads and prunes the registry.
         self._leases = _lease_manager(path)
         # The ``(seq, sid)`` this read-only store itself leases, so close()
         # can release just that reference. ``None`` on a writer.
@@ -2053,15 +2075,15 @@ class Store:
         seq = self._ro_seq if self._read_only else self._seq
         items = self._sorted_snapshot_items(data)
         lo_idx, hi_idx = self._range_window(items, lo, hi)
-        # A read-only cursor rides the store's cross-process lease registry:
-        # it leases its pinned snapshot (the open-time one here, so the
-        # identity is already known) and a writer in any process then keeps
-        # that copy. Writer cursors are visible to the reclaimer in-process
-        # and take no lease.
+        # Every cursor rides the store's cross-process lease registry,
+        # writer and read-only alike: it leases its pinned snapshot from
+        # open to close, so a writer in any process keeps that copy. A
+        # read-only cursor's identity is the store's open-time one; a writer
+        # cursor's is derived when the lease is registered.
         return ScanCursor(
             items, lo_idx, hi_idx, seq=seq, lo=lo, hi=hi,
             publisher=self._snapshot_publisher(),
-            leases=(self._leases if self._read_only else None),
+            leases=self._leases,
             sid=(self._ro_sid if self._read_only else None))
 
     # -- resumable scan tokens ---------------------------------------------
@@ -2096,9 +2118,12 @@ class Store:
 
         The image -- a header frame carrying the sequence, then the
         canonical put frames -- is content-addressed as
-        ``wal.s<seq>.<id>`` and atomically replaced, so republishing is a
-        no-op and a kill mid-publish leaves only a temp file the next open
-        reclaims. Writer-only: read-only stores never publish snapshot
+        ``wal.s<seq>.<id>`` and atomically replaced, so republishing an
+        intact copy is a no-op and a kill mid-publish leaves only a temp
+        file the next open reclaims. An existing copy is trusted only after
+        its content is checked against the identity in its name; a damaged
+        copy is atomically replaced by the correct image, never repaired in
+        place. Writer-only: read-only stores never publish snapshot
         copies (their cross-process pin rides the lease sidecar instead).
         The empty initial snapshot (sequence 0) needs no file: it is the
         well-known empty content and always reconstructible.
@@ -2109,7 +2134,13 @@ class Store:
             sid = _snapshot_id(items)
         path = self._snapshot_blob_path(seq, sid)
         if os.path.exists(path):
-            return
+            # A copy is usable only when its content matches the identity in
+            # its name. An intact copy makes republishing a no-op; a damaged
+            # one is never trusted and never repaired in place -- it is
+            # replaced by the very same atomic publish as a missing one. An
+            # unreadable copy is left alone rather than guessed at.
+            if self._snapshot_copy_ok(path, seq, sid) is not False:
+                return
         blob = _encode_frame(_OP_SNAP, seq=seq) + _snapshot_image(items)
 
         def write(f):
@@ -2174,7 +2205,11 @@ class Store:
         Before removing any single copy every lease is re-read, so a lease
         registered while the sweep runs still protects its copy; stale lease
         sidecars (a process killed without closing, its heartbeat stopped)
-        are swept first. The scan is idempotent and kill-safe: each unlink
+        are swept first. Every copy's content is also checked against the
+        identity in its name before the writer treats it as usable: a
+        damaged copy -- content that does not match -- is never trusted and
+        never repaired in place, and is reclaimed here like any dead copy.
+        The scan is idempotent and kill-safe: each unlink
         is independent, re-running reaches the same set of files, and a run
         killed at any unlink is simply finished on the next open; malformed
         sidecar names are ignored rather than treated as files to delete.
@@ -2200,13 +2235,24 @@ class Store:
         kept_seqs = {self._seq, *predecessors[:_SNAPSHOT_RETENTION]}
         removed = False
         for seq, sid, name in copies:
-            if seq == self._seq or seq in kept_seqs:
+            ok = self._snapshot_copy_ok(
+                os.path.join(self._dir, name), seq, sid)
+            if ok is None:
+                # Unreadable right now: neither trust it nor remove it.
                 continue
-            # Re-scan every cross-process lease immediately before this
-            # unlink: an unexpired lease -- including one acquired after the
-            # sweep began -- keeps the copy, however briefly the window.
-            if (seq, sid) in self._in_use_keys():
-                continue
+            if ok is not False:
+                if seq == self._seq or seq in kept_seqs:
+                    continue
+                # Re-scan every cross-process lease immediately before this
+                # unlink: an unexpired lease -- including one acquired after
+                # the sweep began -- keeps the copy, however briefly the
+                # window.
+                if (seq, sid) in self._in_use_keys():
+                    continue
+            # Either the copy is damaged (its content does not match the
+            # identity in its name, so it can never serve a read or a
+            # resume) or it is a redundant generation with no user; both are
+            # reclaimed by one independent unlink.
             try:
                 os.unlink(os.path.join(self._dir, name))
             except FileNotFoundError:
@@ -2216,43 +2262,70 @@ class Store:
             _fsync_dir(self._dir)
 
     def _read_snapshot_blob(self, seq: int, sid: bytes):
-        """Load and verify a published snapshot sidecar; ``None`` if absent.
+        """Load a published snapshot sidecar; ``None`` if absent or damaged.
 
-        The blob must be a clean frame sequence: one snapshot header with
-        the token's sequence, then put frames with strictly increasing keys
-        whose canonical image hashes to the token's identity. A damaged or
-        mismatched sidecar is corruption of the snapshot machinery, never
-        silently skipped.
+        A copy is trustworthy only when its actual content matches the
+        content identity its name carries, so every read verifies the blob
+        against ``sid`` before a single key of it is served. A damaged copy
+        is not corruption of the store and is never an error here: it is
+        simply not a source, and the caller falls back to rebuilding the
+        snapshot from the committed log prefix or the checkpoint.
         """
         path = self._snapshot_blob_path(seq, sid)
         try:
             with open(path, "rb") as f:
                 raw = f.read()
-        except FileNotFoundError:
+        except OSError:
+            # Absent -- or unreadable right now: either way this copy cannot
+            # serve the resolve, and the durable sources are consulted next.
             return None
-        except OSError as exc:
-            raise CorruptLogError(f"snapshot sidecar is unreadable: {exc}")
+        return self._verify_snapshot_blob(raw, seq, sid)
+
+    def _verify_snapshot_blob(self, raw: bytes, seq: int, sid: bytes):
+        """The items of one snapshot copy, or ``None`` when it is damaged.
+
+        The blob must be a clean frame sequence: one snapshot header with
+        the token's sequence, then put frames with strictly increasing keys
+        whose canonical image hashes to the content identity. Anything else
+        -- torn, unparseable, mis-sequenced, unsorted or identity-mismatching
+        -- is a damaged copy: never trusted, never guessed from and never
+        repaired in place.
+        """
         frames, terminal = self._scan_bytes(raw)
         if terminal is not None or not frames:
-            raise CorruptLogError("snapshot sidecar is not a clean image")
+            return None
         head = frames[0][0]
         if head.get("t") != _OP_SNAP or head.get("s") != seq:
-            raise CorruptLogError(
-                "snapshot sidecar does not match its name")
+            return None
         items = []
         last_key = None
         for meta, value, _start, _end in frames[1:]:
             key = meta.get("k")
             if (meta.get("t") != _OP_PUT or not isinstance(key, str)
                     or key == ""):
-                raise CorruptLogError("snapshot sidecar holds a non-put frame")
+                return None
             if last_key is not None and key <= last_key:
-                raise CorruptLogError("snapshot sidecar keys are not sorted")
+                return None
             items.append((key, value))
             last_key = key
         if _snapshot_id(items) != sid:
-            raise CorruptLogError("snapshot sidecar fails its identity check")
+            return None
         return items
+
+    def _snapshot_copy_ok(self, path: str, seq: int, sid: bytes):
+        """Content check of one published copy against its name.
+
+        ``True`` when the file's content matches the content identity its
+        name carries, ``False`` when it is damaged (and must never be
+        trusted as a source), ``None`` when it cannot be read right now
+        (a transient failure -- neither trusted nor removed).
+        """
+        try:
+            with open(path, "rb") as f:
+                raw = f.read()
+        except OSError:
+            return None
+        return self._verify_snapshot_blob(raw, seq, sid) is not None
 
     def _snapshot_from_logs(self, seq: int, sid: bytes):
         """Reconstruct the committed snapshot at ``seq`` from durable files.
@@ -2312,7 +2385,11 @@ class Store:
         Resolution order: the process-wide registry of live snapshots, this
         store's own committed state, the durable ``wal.s`` sidecar a writer
         published when the token was minted, and the committed prefix of
-        the log or checkpoint. The empty initial snapshot (sequence 0) is
+        the log or checkpoint. A sidecar whose content fails the identity
+        check is damaged and is simply not a source: the snapshot is
+        rebuilt from the log prefix or the checkpoint instead, so the
+        resolved items are byte-identical to resolving through the copy.
+        The empty initial snapshot (sequence 0) is
         always reconstructible. Anything else is a forged, stale or foreign
         token and is rejected without guessing.
         """
@@ -2349,13 +2426,13 @@ class Store:
         lo_idx, hi_idx = self._range_window(items, lo, hi)
         if not lo_idx <= pos <= hi_idx:
             raise ValueError("scan token position is out of range")
-        # A read-only resume session leases the token's (possibly older)
-        # pinned snapshot so a writer in another process keeps its copy; a
-        # writer resume is protected by its own in-process pin.
+        # A resume session -- on a writer or a read-only store alike --
+        # leases the token's (possibly older) pinned snapshot, so a writer
+        # in any process keeps its copy for as long as the resumed scan is
+        # alive.
         return ScanCursor(items, lo_idx, hi_idx, pos=pos, seq=seq, lo=lo,
                           hi=hi, publisher=self._snapshot_publisher(),
-                          sid=sid,
-                          leases=(self._leases if self._read_only else None))
+                          sid=sid, leases=self._leases)
 
     def delete(self, key: str | None, end: str | None = None) -> None:
         """Delete one key, or a half-open byte range when ``end`` is given.
