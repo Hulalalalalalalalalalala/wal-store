@@ -88,17 +88,21 @@ without ``close()`` releases its pin when it is garbage collected.
 A copy's name carries its content identity, and every use of a copy
 verifies the file against it: when the store is opened, when a token is
 resumed and when the writer decides whether a copy is usable, the actual
-bytes on disk must hash to the identity in the name. A copy whose content
-does not match its identity is damaged; it is never trusted as a source,
-never guessed at and never repaired in place, and it changes neither the
-committed state nor any read by a byte. Reads and resumed scans rebuild
-the snapshot from the committed log prefix or the checkpoint instead --
-byte-for-byte the result a healthy copy would have served -- and the
-writer reclaims the damaged file in its ordinary sweep (publishing or
-replacing a copy stays atomic and kill-safe, so a kill at any point and a
-reopen converge to the same copy set). Only when the copy, the log prefix
-and the checkpoint can none of them rebuild the snapshot does an old
-token stop resolving (``ValueError``).
+bytes on disk must hash to the identity in the name. Every verification
+is incremental -- a copy is checked through a fixed-size read buffer
+with the content identity computed as a running hash -- so verifying or
+reclaiming a copy never holds the whole copy in memory, and the memory
+peak does not grow with the copy's size, however large the snapshot. A
+copy whose content does not match its identity is damaged; it is never
+trusted as a source, never guessed at and never repaired in place, and
+it changes neither the committed state nor any read by a byte. Reads and
+resumed scans rebuild the snapshot from the committed log prefix or the
+checkpoint instead -- byte-for-byte the result a healthy copy would have
+served -- and the writer reclaims the damaged file in its ordinary sweep
+(publishing or replacing a copy stays atomic and kill-safe, so a kill at
+any point and a reopen converge to the same copy set). Only when the
+copy, the log prefix and the checkpoint can none of them rebuild the
+snapshot does an old token stop resolving (``ValueError``).
 
 The in-process pin set cannot see users in other processes, so every
 read-only store -- and every cursor and resume session, on either open
@@ -123,11 +127,14 @@ Reclamation deletes only redundant copies, never the log, the checkpoint
 or a record, and changes neither the durable sequence nor the committed
 state; the sweep is a set of independent unlinks followed by a directory
 sync, so a kill at any point and a reopen converges to the same file set.
-Losing a copy does not invalidate its token while the snapshot can still
-be rebuilt from the log prefix or the checkpoint, and a damaged copy
-counts as no copy at all; only once no usable copy remains and neither
-durable source can rebuild it does an old token stop resolving
-(``ValueError``).
+One sweep reads each copy at most once -- the verification results a
+publish in the same operation already produced are shared with the sweep
+rather than re-read -- and syncs the directory a bounded number of times,
+neither count growing with the number of copies. Losing a copy does not
+invalidate its token while the snapshot can still be rebuilt from the log
+prefix or the checkpoint, and a damaged copy counts as no copy at all;
+only once no usable copy remains and neither durable source can rebuild
+it does an old token stop resolving (``ValueError``).
 
 
 Range deletes (``Store.delete_range(start, end)``, or ``delete(start,
@@ -301,11 +308,11 @@ class ScanCursor:
         # need cross-process protection.
         if leases is not None and seq >= 1:
             if sid is None:
-                sid = _snapshot_id(items)
+                # The pin box owns the identity derivation and its lazy
+                # cache; the cursor only reads the identity back and never
+                # writes the box's fields.
+                sid = self._box.sid()
                 self._sid = sid
-                # Share the derived identity with the pin box, exactly as a
-                # lazy token mint would.
-                self._box._sid = sid
             leases.acquire(seq, sid)
             self._lease_held = True
             # A cursor dropped without close() must release its lease the way
@@ -347,10 +354,9 @@ class ScanCursor:
         if self._closed:
             raise ValueError("scan cursor is closed")
         if self._sid is None:
-            self._sid = _snapshot_id(self._items)
-            # Share the derived identity with the pin box so the in-use
-            # check at reclamation never hashes this snapshot again.
-            self._box._sid = self._sid
+            # The pin box derives and caches the identity, so the in-use
+            # check at reclamation never hashes this snapshot again either.
+            self._sid = self._box.sid()
         if self._publisher is not None:
             self._publisher(self._seq, self._sid, self._items)
         return _encode_token(self._seq, self._sid, self._lo, self._hi,
@@ -441,20 +447,38 @@ _LEASE_REC_LEN = (len(_LEASE_REC_PREFIX) + _LEASE_SEQ_MAX + 1
                   + _LEASE_SID_HEX + 1 + _LEASE_TS_LEN + 1)
 
 
+def _iter_snapshot_frames(items):
+    """Yield the canonical put frames of a committed snapshot, one at a time.
+
+    ``items`` must already be sorted by the keys' raw UTF-8 bytes. Each
+    frame uses the same deterministic framing as the log, so the sequence
+    is identical on every platform for the same snapshot -- and streaming
+    it frame by frame never holds the whole image in memory at once.
+    """
+    for key, value in items:
+        yield _encode_frame(_OP_PUT, value, key=key)
+
+
 def _snapshot_image(items) -> bytes:
     """Canonical byte image of a committed snapshot: one put frame per key.
 
-    ``items`` must already be sorted by the keys' raw UTF-8 bytes. The
-    image uses the same deterministic framing as the log, so it is
-    identical on every platform for the same snapshot.
+    The image is the concatenation of :func:`_iter_snapshot_frames` over
+    the sorted items, identical on every platform for the same snapshot.
     """
-    return b"".join(_encode_frame(_OP_PUT, value, key=key)
-                    for key, value in items)
+    return b"".join(_iter_snapshot_frames(items))
 
 
 def _snapshot_id(items) -> bytes:
-    """Content identity of a committed snapshot (32 raw bytes)."""
-    return hashlib.sha256(_snapshot_image(items)).digest()
+    """Content identity of a committed snapshot (32 raw bytes).
+
+    Computed incrementally over the canonical image: the hash runs frame
+    by frame, so deriving an identity never holds the whole image in
+    memory at once.
+    """
+    digest = hashlib.sha256()
+    for frame in _iter_snapshot_frames(items):
+        digest.update(frame)
+    return digest.digest()
 
 
 def _encode_token(seq: int, sid: bytes, lo: bytes | None,
@@ -1155,6 +1179,108 @@ def _iter_frames(f):
             yield "invalid", start
             return
         yield "frame", meta, payload[newline + 1:], start, f.tell()
+
+
+# Size of the fixed read buffer every on-disk snapshot copy is streamed
+# through. A copy is verified with nothing larger than one read chunk (plus
+# one frame's compact metadata) resident, so verification memory stays
+# constant whatever the copy's size and however many frames it holds.
+_SNAPSHOT_READ_CHUNK = 1 << 16
+
+
+def _verify_snapshot_blob(path: str, seq: int, sid: bytes) -> bool:
+    """Verify an on-disk snapshot copy incrementally against its identity.
+
+    Returns ``True`` only when the file is a clean frame sequence -- one
+    snapshot header carrying ``seq`` followed by put frames with strictly
+    increasing keys -- whose put-frame bytes, streamed through a fixed-size
+    read buffer, hash to the content identity ``sid``. Every other shape --
+    torn, rewritten, mis-headed, unsorted, truncated, simply unreadable -- is
+    a damaged copy and yields ``False``. Nothing is trusted from the name
+    but the two values the bytes must match, and the whole copy never sits
+    in memory at once: payloads are consumed in bounded chunks feeding the
+    running hash and each frame's checksum, and only a frame's compact
+    metadata is retained to check the header and the key order.
+    """
+    digest = hashlib.sha256()
+    saw_head = False
+    last_key = None
+    try:
+        with open(path, "rb") as f:
+            while True:
+                header = f.read(_HEADER)
+                if not header:
+                    break
+                if len(header) < _HEADER or header[:4] != _MAGIC:
+                    return False
+                if int.from_bytes(header[_PREFIX:], "big") != zlib.crc32(
+                        header[:_PREFIX]):
+                    return False
+                length = int.from_bytes(header[4:_PREFIX], "big")
+                if length > _MAX_PAYLOAD:
+                    return False
+                # The content identity covers only the canonical put frames;
+                # the snapshot header frame is checksum-verified like any
+                # other but stays out of the running hash.
+                sink = digest.update if saw_head else None
+                if sink is not None:
+                    sink(header)
+                # Stream the payload in bounded chunks: each chunk feeds the
+                # content hash and the running payload checksum, and bytes up
+                # to the first newline are retained as the frame metadata.
+                # The value itself is never retained -- the running hash is
+                # what vouches for it.
+                remaining = length
+                payload_crc = 0
+                head = b""
+                newline = -1
+                while remaining:
+                    chunk = f.read(min(remaining, _SNAPSHOT_READ_CHUNK))
+                    if not chunk:
+                        return False
+                    if sink is not None:
+                        sink(chunk)
+                    payload_crc = zlib.crc32(chunk, payload_crc)
+                    consumed = length - remaining
+                    remaining -= len(chunk)
+                    if newline < 0:
+                        nl = chunk.find(b"\n")
+                        if nl >= 0:
+                            newline = consumed + nl
+                            head += chunk[:nl]
+                        else:
+                            head += chunk
+                trailer = f.read(_TRAILER)
+                if len(trailer) < _TRAILER:
+                    return False
+                if sink is not None:
+                    sink(trailer)
+                if (int.from_bytes(trailer, "big") != payload_crc
+                        or newline < 0):
+                    return False
+                try:
+                    meta = json.loads(head)
+                except (ValueError, UnicodeDecodeError):
+                    return False
+                if not saw_head:
+                    if not (isinstance(meta, dict)
+                            and meta.get("t") == _OP_SNAP
+                            and meta.get("s") == seq):
+                        return False
+                    saw_head = True
+                    continue
+                key = meta.get("k")
+                if (not isinstance(meta, dict) or meta.get("t") != _OP_PUT
+                        or not isinstance(key, str) or key == ""):
+                    return False
+                if last_key is not None and key <= last_key:
+                    return False
+                last_key = key
+    except OSError:
+        # Absent or unreadable: not a usable source either way.
+        return False
+    # A copy always carries a snapshot header; an empty file is damaged.
+    return saw_head and digest.digest() == sid
 
 
 def _fsync_dir(path: str) -> None:
@@ -1895,11 +2021,12 @@ class Store:
         self._corrupt = False
         # Make the recovered committed snapshot resumable by token even
         # before this session commits again (an old-version directory or a
-        # reopened store). Best-effort below the write path.
-        self._archive_current_snapshot()
+        # reopened store). Best-effort below the write path. The copy it
+        # leaves verified is passed to the sweep so this open reads it once.
+        known_good = self._archive_current_snapshot()
         # Finish any reclamation a previous commit/compaction (or its kill)
         # left, converging the historical-copy set at every open.
-        self._reclaim_snapshots()
+        self._reclaim_snapshots(known_good)
 
     def _converge_on_open(self) -> None:
         """Crash cleanup at open; leave a corrupt store inert for recover()."""
@@ -2199,7 +2326,7 @@ class Store:
             self._dir, f"{_SNAPSHOT_PREFIX}{seq}.{sid.hex()}")
 
     def _publish_snapshot(self, seq: int, sid: bytes | None,
-                          items) -> None:
+                          items):
         """Durably publish a pinned snapshot image for later token resumes.
 
         The image -- a header frame carrying the sequence, then the
@@ -2207,39 +2334,54 @@ class Store:
         ``wal.s<seq>.<id>`` and atomically replaced, so republishing over a
         healthy copy is a no-op and a kill mid-publish leaves only a temp
         file the next open reclaims. An existing file is first verified
-        against the content identity in its name: a damaged copy at the
-        content address is atomically *replaced* by the authoritative image
-        (never edited in place), keeping the publish and the replace
-        kill-safe at any point. Writer-only: read-only stores never publish
-        snapshot copies (their cross-process pin rides the lease sidecar
-        instead). The empty initial snapshot (sequence 0) needs no file: it
-        is the well-known empty content and always reconstructible.
+        against the content identity in its name -- incrementally, through
+        a fixed-size read buffer: a damaged copy at the content address is
+        atomically *replaced* by the authoritative image (never edited in
+        place), keeping the publish and the replace kill-safe at any point.
+        Writer-only: read-only stores never publish snapshot copies (their
+        cross-process pin rides the lease sidecar instead). The empty
+        initial snapshot (sequence 0) needs no file: it is the well-known
+        empty content and always reconstructible.
+
+        Returns the ``(seq, sid)`` key whenever this call leaves a
+        known-good copy on disk -- an existing copy that just verified, or
+        one this call wrote itself -- so a reclaim sweep in the same
+        cleanup can trust it without reading the file a second time.
+        Returns ``None`` for the empty initial snapshot, which has no file.
         """
         if seq == 0:
-            return
+            return None
         if sid is None:
             sid = _snapshot_id(items)
         path = self._snapshot_blob_path(seq, sid)
         if os.path.exists(path):
-            if self._read_snapshot_blob(seq, sid, path) is not None:
-                return
+            if _verify_snapshot_blob(path, seq, sid):
+                return (seq, sid)
             # The file at the content address fails verification: fall
             # through and replace it atomically with the correct image.
-        blob = _encode_frame(_OP_SNAP, seq=seq) + _snapshot_image(items)
+        head = _encode_frame(_OP_SNAP, seq=seq)
 
         def write(f):
-            f.write(blob)
+            # Stream the image frame by frame: the staged file gets exactly
+            # the canonical bytes without a second full copy in memory.
+            f.write(head)
+            for frame in _iter_snapshot_frames(items):
+                f.write(frame)
 
         self._atomic_file(path, write)
+        return (seq, sid)
 
-    def _archive_current_snapshot(self) -> None:
-        """Publish the current committed snapshot's sidecar if missing."""
+    def _archive_current_snapshot(self):
+        """Publish the current committed snapshot's sidecar if missing.
+
+        Returns the ``(seq, sid)`` key of the known-good copy, or ``None``
+        for the empty initial snapshot, which needs no file: it is always
+        reconstructible from its well-known content identity.
+        """
         if self._seq == 0:
-            # The empty initial snapshot needs no file: it is always
-            # reconstructible from its well-known content identity.
-            return
-        self._publish_snapshot(self._seq, None,
-                               self._sorted_snapshot_items(self._data))
+            return None
+        return self._publish_snapshot(
+            self._seq, None, self._sorted_snapshot_items(self._data))
 
     # -- historical-copy reclamation --------------------------------------
 
@@ -2272,7 +2414,7 @@ class Store:
         """
         return _live_snapshot_keys() | self._leases.live_keys()
 
-    def _reclaim_snapshots(self) -> None:
+    def _reclaim_snapshots(self, known_good=None) -> None:
         """Reclaim published snapshot copies that are neither used nor kept.
 
         A copy is kept when it is the current committed snapshot, when it
@@ -2286,12 +2428,17 @@ class Store:
         deleted -- the log prefix and the checkpoint are untouched -- so
         ongoing reads and resumed scans do not change by a byte.
 
-        Every copy is first verified against the content identity in its
-        name. A copy whose bytes do not hash to that identity is damaged:
-        it can serve no reader or resume (those rebuild the snapshot from
-        the committed log prefix or the checkpoint instead), so it is
-        reclaimed outright, whatever the retention window or the in-use set
-        says, and it does not count as a published generation.
+        Every copy is verified against the content identity in its name --
+        incrementally, streamed through a fixed-size read buffer, so the
+        memory peak of the sweep never grows with a copy's size. A copy
+        whose bytes do not hash to that identity is damaged: it can serve
+        no reader or resume (those rebuild the snapshot from the committed
+        log prefix or the checkpoint instead), so it is reclaimed outright,
+        whatever the retention window or the in-use set says, and it does
+        not count as a published generation. ``known_good`` is a
+        ``(seq, sid)`` key the same cleanup already verified or wrote (the
+        current snapshot's publish), so one cleanup reads every copy at
+        most once rather than re-reading what it just checked.
 
         Before removing any single copy every lease is re-read, so a lease
         registered while the sweep runs still protects its copy; stale lease
@@ -2300,6 +2447,7 @@ class Store:
         is independent, re-running reaches the same set of files, and a run
         killed at any unlink is simply finished on the next open; malformed
         sidecar names are ignored rather than treated as files to delete.
+        The directory is synced once at the end, never per copy.
         """
         copies = []    # (seq, sid, name) verified against their identity
         damaged = []   # (seq, sid, name) failing verification
@@ -2312,11 +2460,17 @@ class Store:
             if parsed is None:
                 continue
             seq, sid = parsed
-            path = os.path.join(self._dir, name)
-            if self._read_snapshot_blob(seq, sid, path) is None:
-                damaged.append((seq, sid, name))
-            else:
+            if known_good is not None and (seq, sid) == known_good:
+                # Already verified (or atomically written) earlier in this
+                # same cleanup: counting it here merges what would be a
+                # second full read of the same copy into the first.
                 copies.append((seq, sid, name))
+                continue
+            path = os.path.join(self._dir, name)
+            if _verify_snapshot_blob(path, seq, sid):
+                copies.append((seq, sid, name))
+            else:
+                damaged.append((seq, sid, name))
         # Forget lease sidecars whose owner stopped heartbeating before
         # consulting the registry, so a killed process cannot pin a copy
         # past the TTL. Best-effort: a sweep that fails changes nothing.
@@ -2362,39 +2516,50 @@ class Store:
         The blob must be a clean frame sequence: one snapshot header with
         the token's sequence, then put frames with strictly increasing keys
         whose canonical image hashes to the content identity in the name.
-        A copy whose actual content does not match that identity -- torn,
-        rewritten, mis-headed, unsorted or simply absent -- is *damaged*:
-        it is never trusted as a source, never guessed at and never repaired
-        in place, so this returns ``None`` exactly as if no copy existed.
-        Callers rebuild the snapshot from the committed log prefix or the
-        checkpoint instead, and the writer's reclamation removes the file.
+        The file is scanned frame by frame -- never read whole -- and the
+        identity is recomputed as a running hash over the put frames as they
+        are verified, so the only snapshot-sized structure held is the item
+        list the caller itself asked for. A copy whose actual content does
+        not match that identity -- torn, rewritten, mis-headed, unsorted or
+        simply absent -- is *damaged*: it is never trusted as a source,
+        never guessed at and never repaired in place, so this returns
+        ``None`` exactly as if no copy existed. Callers rebuild the snapshot
+        from the committed log prefix or the checkpoint instead, and the
+        writer's reclamation removes the file.
         """
         if path is None:
             path = self._snapshot_blob_path(seq, sid)
+        digest = hashlib.sha256()
+        items = []
+        last_key = None
         try:
             with open(path, "rb") as f:
-                raw = f.read()
+                head_meta = None
+                for event in _iter_frames(f):
+                    if event[0] != "frame":
+                        # A torn or invalid frame anywhere: damaged copy.
+                        return None
+                    _, meta, value, _start, _end = event
+                    if head_meta is None:
+                        if meta.get("t") != _OP_SNAP or meta.get("s") != seq:
+                            return None
+                        head_meta = meta
+                        continue
+                    key = meta.get("k")
+                    if (meta.get("t") != _OP_PUT or not isinstance(key, str)
+                            or key == ""):
+                        return None
+                    if last_key is not None and key <= last_key:
+                        return None
+                    digest.update(_encode_frame(_OP_PUT, value, key=key))
+                    items.append((key, value))
+                    last_key = key
         except OSError:
             # Absent or unreadable: not a usable source either way.
             return None
-        frames, terminal = self._scan_bytes(raw)
-        if terminal is not None or not frames:
+        if head_meta is None:
             return None
-        head = frames[0][0]
-        if head.get("t") != _OP_SNAP or head.get("s") != seq:
-            return None
-        items = []
-        last_key = None
-        for meta, value, _start, _end in frames[1:]:
-            key = meta.get("k")
-            if (meta.get("t") != _OP_PUT or not isinstance(key, str)
-                    or key == ""):
-                return None
-            if last_key is not None and key <= last_key:
-                return None
-            items.append((key, value))
-            last_key = key
-        if _snapshot_id(items) != sid:
+        if digest.digest() != sid:
             return None
         return items
 
@@ -2403,51 +2568,57 @@ class Store:
 
         Replays only the committed prefix ending at the commit (or base)
         marker carrying ``seq`` -- never uncommitted bytes, never anything
-        past the pinned point -- from ``wal.log`` or ``wal.ckp``. Returns
-        the sorted items when the reconstructed snapshot's identity matches
-        ``sid``, else ``None``.
+        past the pinned point -- from ``wal.log`` or ``wal.ckp``, streamed
+        frame by frame rather than read whole. Returns the sorted items when
+        the reconstructed snapshot's identity matches ``sid``, else
+        ``None``.
         """
         if seq < 1:
             return None
         for path in (self._path, self._ckp_path):
             try:
-                frames, _terminal = self._read_log(path)
-            except (FileNotFoundError, OSError):
+                with open(path, "rb") as f:
+                    state: dict[str, bytes] = {}
+                    for event in _iter_frames(f):
+                        if event[0] != "frame":
+                            # Torn or invalid tail: nothing usable past here.
+                            break
+                        _, meta, value, _start, _end = event
+                        op = meta.get("t")
+                        if op in _COMMIT_OPS:
+                            marker_seq = meta.get("s")
+                            if not isinstance(marker_seq, int):
+                                break
+                            if marker_seq >= seq:
+                                if marker_seq == seq:
+                                    items = self._sorted_snapshot_items(state)
+                                    if _snapshot_id(items) == sid:
+                                        return items
+                                break
+                            continue
+                        if op == _OP_PUT:
+                            key = meta.get("k")
+                            if not isinstance(key, str):
+                                break
+                            state[key] = value
+                        elif op == _OP_DELETE:
+                            key = meta.get("k")
+                            if not isinstance(key, str):
+                                break
+                            state.pop(key, None)
+                        elif op == _OP_RANGE:
+                            try:
+                                lo, hi = _range_bounds_from_meta(meta)
+                            except CorruptLogError:
+                                break
+                            for key in [k for k in state
+                                        if _key_in_range(k.encode("utf-8"),
+                                                         lo, hi)]:
+                                del state[key]
+                        else:
+                            break
+            except OSError:
                 continue
-            state: dict[str, bytes] = {}
-            for meta, value, _start, _end in frames:
-                op = meta.get("t")
-                if op in _COMMIT_OPS:
-                    marker_seq = meta.get("s")
-                    if not isinstance(marker_seq, int):
-                        break
-                    if marker_seq >= seq:
-                        if marker_seq == seq:
-                            items = self._sorted_snapshot_items(state)
-                            if _snapshot_id(items) == sid:
-                                return items
-                        break
-                    continue
-                if op == _OP_PUT:
-                    key = meta.get("k")
-                    if not isinstance(key, str):
-                        break
-                    state[key] = value
-                elif op == _OP_DELETE:
-                    key = meta.get("k")
-                    if not isinstance(key, str):
-                        break
-                    state.pop(key, None)
-                elif op == _OP_RANGE:
-                    try:
-                        lo, hi = _range_bounds_from_meta(meta)
-                    except CorruptLogError:
-                        break
-                    for key in [k for k in state
-                                if _key_in_range(k.encode("utf-8"), lo, hi)]:
-                        del state[key]
-                else:
-                    break
         return None
 
     def _resolve_token_snapshot(self, seq: int, sid: bytes) -> list:
@@ -2589,14 +2760,15 @@ class Store:
         # compaction and reclamation. Content-addressed and atomic, so a
         # repeated publish is a no-op and a kill leaves only a reclaimed
         # temp file.
-        self._publish_snapshot(self._seq, None,
-                               self._sorted_snapshot_items(self._data))
+        known_good = self._publish_snapshot(
+            self._seq, None, self._sorted_snapshot_items(self._data))
         if had_marker:
             self._remove_marker()
         # Reclaim historical copies now that the new committed snapshot is
         # durably published: only the current one, the newest three
-        # generations and copies currently in use survive.
-        self._reclaim_snapshots()
+        # generations and copies currently in use survive. The copy just
+        # published is already verified, so the sweep does not read it again.
+        self._reclaim_snapshots(known_good)
         return self._seq
 
     def recover(self) -> dict:
@@ -2635,8 +2807,8 @@ class Store:
         self._corrupt = False
         # Converge the historical-copy set as an open does; the report is
         # unaffected because reclamation deletes only redundant copies.
-        self._archive_current_snapshot()
-        self._reclaim_snapshots()
+        known_good = self._archive_current_snapshot()
+        self._reclaim_snapshots(known_good)
         return {"applied": applied, "discarded": discarded, "seq": seq}
 
     def compact(self) -> dict:
@@ -2685,8 +2857,8 @@ class Store:
         # The old log space is gone; make sure the surviving committed
         # snapshot is published as a copy, then run the same reclamation a
         # commit performs so dead historical copies do not accumulate here.
-        self._archive_current_snapshot()
-        self._reclaim_snapshots()
+        known_good = self._archive_current_snapshot()
+        self._reclaim_snapshots(known_good)
 
         self._entries = 0 if seq == 0 else live + 1
         self._pending = 0
