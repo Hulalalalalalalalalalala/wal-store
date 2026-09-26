@@ -7,16 +7,20 @@ process:
   lease on open, sharing one short-lived ``wal.lease.*`` sidecar per
   process and directory, and removing it on close (or on garbage
   collection when dropped without ``close()``);
+* a writer's cursor and resume session registering leases with the same
+  scope as a read-only one, protecting the pinned snapshot from a writer
+  in another process;
 * a snapshot pinned by a reader/cursor in *another process* surviving a
   writer's commits, compactions and reopens, then being reclaimed once the
-  holder exits cleanly or is killed and its heartbeat goes stale;
+  holder exits cleanly or is killed -- expiry detected by the stale
+  heartbeat or immediately by the owner process no longer existing;
 * the writer re-reading the leases before every unlink and never removing
   a copy a fresh lease names, while a stale, malformed or foreign lease
   neither protects anything nor breaks the sweep;
 * files whose name is not a legal lease sidecar being ignored entirely --
   never parsed, never deleted;
 * a reader in a read-only directory working with no lease and no error;
-* a writer itself never creating a lease sidecar.
+* a writer itself never creating a lease sidecar without a cursor.
 """
 
 import base64
@@ -107,6 +111,15 @@ class LeaseBase(unittest.TestCase):
         self.assertEqual(p.stdout.readline().strip(), b"[('old', b'o')]")
         p.stdout.close()
         return p
+
+    def _write_fake_lease(self, seq, sid, ts, pid=999999, raw=None):
+        name = "%s%d.%s" % (_LEASE_PREFIX, pid, "ab" * 16)
+        path = os.path.join(self.dir, name)
+        if raw is None:
+            raw = _LeaseManager._record(seq, sid, ts)
+        with open(path, "wb") as f:
+            f.write(raw)
+        return name
 
 
 class LeaseFileLifecycleTest(LeaseBase):
@@ -265,15 +278,6 @@ class CrossProcessLeaseTest(LeaseBase):
 
 
 class LeaseContentTest(LeaseBase):
-    def _write_fake_lease(self, seq, sid, ts, pid=999999, raw=None):
-        name = "%s%d.%s" % (_LEASE_PREFIX, pid, "ab" * 16)
-        path = os.path.join(self.dir, name)
-        if raw is None:
-            raw = _LeaseManager._record(seq, sid, ts)
-        with open(path, "wb") as f:
-            f.write(raw)
-        return name
-
     def test_fresh_foreign_lease_protects_named_copy(self):
         with self.writer() as s:
             s.put("old", b"o")
@@ -281,7 +285,8 @@ class LeaseContentTest(LeaseBase):
             # The seq 1 copy and its identity.
             copy = [n for n in os.listdir(self.dir) if n.startswith("wal.s1.")][0]
             sid = bytes.fromhex(copy.split(".")[2])
-        self._write_fake_lease(1, sid, time.time())
+        # A live owner's fresh lease (this process's pid) protects the copy.
+        self._write_fake_lease(1, sid, time.time(), pid=os.getpid())
         self.advance_past_retention()
         self.assertTrue(self.old_copy_present())
 
@@ -328,6 +333,96 @@ class LeaseContentTest(LeaseBase):
         self.advance_past_retention()
         for n in decoys:
             self.assertTrue(os.path.exists(os.path.join(self.dir, n)), n)
+
+
+class WriterLeaseTest(LeaseBase):
+    """Writer-side cursors and resume sessions register leases too."""
+    def test_writer_cursor_registers_and_releases_lease(self):
+        with self.writer() as s:
+            s.put("a", b"1")
+            s.commit()
+            self.assertEqual(_lease_names(self.dir), [])
+            cur = s.scan()
+            self.assertEqual(len(_lease_names(self.dir)), 1)
+            cur.close()
+            self.assertEqual(_lease_names(self.dir), [])
+        self.assertEqual(_lease_names(self.dir), [])
+
+    def test_writer_resume_session_registers_lease(self):
+        with self.writer() as s:
+            s.put("a", b"1")
+            s.commit()
+            tok = s.scan().token()
+            gc.collect()
+            self.assertEqual(_lease_names(self.dir), [])
+            cur = s.scan(token=tok)
+            self.assertEqual(len(_lease_names(self.dir)), 1)
+            self.assertEqual(list(cur), [("a", b"1")])
+            cur.close()
+            self.assertEqual(_lease_names(self.dir), [])
+
+    def test_dropped_writer_cursor_releases_lease_on_gc(self):
+        with self.writer() as s:
+            s.put("a", b"1")
+            s.commit()
+            cur = s.scan()
+            next(cur)
+            self.assertEqual(len(_lease_names(self.dir)), 1)
+            del cur
+            gc.collect()
+            self.assertEqual(_lease_names(self.dir), [])
+
+    def test_writer_cursor_lease_protects_across_processes(self):
+        # A writer's open cursor pins its snapshot for a writer running in
+        # *another* process through the lease sidecar alone.
+        with self.writer() as s:
+            s.put("old", b"o")
+            s.commit()
+            cur = s.scan()
+            self.assertEqual(next(cur), ("old", b"o"))
+            advance = (
+                "import sys; sys.path.insert(0, %r);"
+                "from wal_store import Store;"
+                "s = Store(sys.argv[1]);"
+                "[(s.put('k%%02d' %% i, b'v'), s.commit()) for i in range(6)];"
+                "s.close()" % REPO_ROOT)
+            done = subprocess.run([sys.executable, "-c", advance, self.dir],
+                                  capture_output=True)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            # seq 1 is far outside the retention window; only this
+            # process's writer-cursor lease keeps its copy.
+            self.assertTrue(self.old_copy_present())
+            cur.close()
+        gc.collect()
+        with self.writer():
+            pass
+        self.assertFalse(self.old_copy_present())
+
+
+class ExitDetectionTest(LeaseBase):
+    def test_killed_holder_expires_by_exit_detection(self):
+        token = self.seed_old_token()
+        p = self.spawn_holder(token)
+        p.send_signal(signal.SIGKILL)
+        p.wait()
+        # The heartbeat is still fresh (nowhere near the TTL), but the
+        # owning process is gone: the lease expires by exit detection and
+        # the copy is reclaimed without waiting out the TTL.
+        self.advance_past_retention()
+        self.assertEqual(_lease_names(self.dir), [])
+        self.assertFalse(self.old_copy_present())
+
+    def test_dead_owner_fake_lease_protects_nothing(self):
+        with self.writer() as s:
+            s.put("old", b"o")
+            s.commit()
+            copy = [n for n in os.listdir(self.dir) if n.startswith("wal.s1.")][0]
+            sid = bytes.fromhex(copy.split(".")[2])
+        # A fresh heartbeat from a pid that does not exist expires at once.
+        self._write_fake_lease(1, sid, time.time(), pid=999999)
+        self.advance_past_retention()
+        self.assertFalse(self.old_copy_present())
+        self.assertEqual(_lease_names(self.dir), [])
 
 
 class LeasePruneKillSafeTest(LeaseBase):

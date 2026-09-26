@@ -132,9 +132,14 @@ so a sweep killed mid-run simply completes on reopen):
   it lists the snapshots that process has in use with a heartbeat, and the
   writer reads every lease before removing a copy (re-reading them
   immediately before each unlink, so a lease taken mid-sweep still
-  protects its copy). An orderly close removes the lease; a process killed
-  without closing stops heartbeating, and after the lease TTL its lease
-  pins nothing and is swept. An in-use token keeps pointing at the same
+  protects its copy). Cursors and resume sessions register leases on
+  either open form of the store — a writer's cursor or resumed scan
+  registers with exactly the same scope as a read-only one. An orderly
+  close removes the lease; a process killed without closing stops
+  heartbeating, and expiry is then detected two ways — the heartbeat goes
+  stale after the lease TTL, and a lease whose owning process no longer
+  exists expires immediately — after which the lease pins nothing and is
+  swept. An in-use token keeps pointing at the same
   snapshot across commits, compactions and crash recovery; resuming it is
   byte-for-byte the tail of the original one-shot scan. Reclamation
   deletes only redundant copies — the reads and resumes in flight do not
@@ -144,20 +149,38 @@ so a sweep killed mid-run simply completes on reopen):
 - **Everything else** — copies outside the retention window with no user
   (no in-process pin and no fresh lease in any process) are deleted.
 
+Every use of a copy also verifies it against the content identity in its
+name: when the store is opened, when a token is resumed, and when the
+writer decides during reclamation whether a copy is usable, the bytes on
+disk must hash to that identity. A copy whose content does not match is
+damaged: it is never trusted as a source, never guessed at and never
+repaired in place, and it changes neither the committed state nor any
+read by a byte. Reads and resumed scans rebuild the snapshot from the
+committed log prefix or the checkpoint instead — byte-for-byte the result
+a healthy copy would have served — and the writer reclaims the damaged
+file in its ordinary sweep (a damaged copy of the *current* snapshot is
+atomically replaced with the authoritative image on the next publish).
+Publishing and replacing copies stays atomic and kill-safe, so a kill at
+any point and a reopen converge to the same copy set.
+
 A copy disappearing does not by itself invalidate a token: the token
 keeps working for as long as that snapshot can still be rebuilt from the
-committed log prefix or the checkpoint. Only once every copy is gone and
-neither the surviving log prefix nor the checkpoint can rebuild the
-snapshot does resuming an old token raise `ValueError`. Forged,
+committed log prefix or the checkpoint. A damaged copy (its content
+failing the identity in its name) counts as no copy at all — it is never
+read from and is reclaimed by the writer. Only once every copy is gone
+or damaged and neither the surviving log prefix nor the checkpoint can
+rebuild the snapshot does resuming an old token raise `ValueError`. Forged,
 truncated, corrupted, out-of-range or cross-snapshot tokens raise
 `ValueError` just as before; the store never guesses or repairs them.
 
 Reclamation is an idempotent convergence: independent file unlinks with
 a directory sync at the end, so a kill at any point leaves a state the
-next open converges to the identical file set. It cannot delete an
-in-use copy (one named by an in-process pin or by any fresh lease),
+next open converges to the identical file set. It cannot delete a
+usable in-use copy (one named by an in-process pin or by any fresh
+lease — a damaged copy serves no one and is removed regardless),
 cannot move the durable sequence or the committed state, and never
-touches `wal.log`, `wal.ckp` or any record; it removes only dead
+touches `wal.log`, `wal.ckp` or any record; it removes only dead or
+damaged
 `wal.s<seq>.<id>` copies and, once expired, stale `wal.lease.*`
 sidecars. Each lease sidecar is written only by its owner and is
 atomically replaced (never edited in place), so registering, expiring
