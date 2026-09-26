@@ -88,17 +88,24 @@ without ``close()`` releases its pin when it is garbage collected.
 A copy's name carries its content identity, and every use of a copy
 verifies the file against it: when the store is opened, when a token is
 resumed and when the writer decides whether a copy is usable, the actual
-bytes on disk must hash to the identity in the name. A copy whose content
-does not match its identity is damaged; it is never trusted as a source,
-never guessed at and never repaired in place, and it changes neither the
-committed state nor any read by a byte. Reads and resumed scans rebuild
-the snapshot from the committed log prefix or the checkpoint instead --
-byte-for-byte the result a healthy copy would have served -- and the
-writer reclaims the damaged file in its ordinary sweep (publishing or
-replacing a copy stays atomic and kill-safe, so a kill at any point and a
-reopen converge to the same copy set). Only when the copy, the log prefix
-and the checkpoint can none of them rebuild the snapshot does an old
-token stop resolving (``ValueError``).
+bytes on disk must hash to the identity in the name. Verification is
+streaming: the copy is read through a fixed-size buffer and the content
+identity is computed incrementally, so checking a copy never holds more
+of it in memory than that buffer, however large the snapshot is, and the
+memory peak of a verification or reclamation pass does not grow with copy
+size. Within one reclamation pass each copy is read from disk at most
+once (the publish check and the sweep share one verdict table) and the
+directory is synced at most once, independent of how many copies exist.
+A copy whose content does not match its identity is damaged; it is never
+trusted as a source, never guessed at and never repaired in place, and it
+changes neither the committed state nor any read by a byte. Reads and
+resumed scans rebuild the snapshot from the committed log prefix or the
+checkpoint instead -- byte-for-byte the result a healthy copy would have
+served -- and the writer reclaims the damaged file in its ordinary sweep
+(publishing or replacing a copy stays atomic and kill-safe, so a kill at
+any point and a reopen converge to the same copy set). Only when the
+copy, the log prefix and the checkpoint can none of them rebuild the
+snapshot does an old token stop resolving (``ValueError``).
 
 The in-process pin set cannot see users in other processes, so every
 read-only store -- and every cursor and resume session, on either open
@@ -305,7 +312,9 @@ class ScanCursor:
                 self._sid = sid
                 # Share the derived identity with the pin box, exactly as a
                 # lazy token mint would.
-                self._box._sid = sid
+                box = self._box
+                if box is not None:
+                    box.share_sid(sid)
             leases.acquire(seq, sid)
             self._lease_held = True
             # A cursor dropped without close() must release its lease the way
@@ -350,7 +359,9 @@ class ScanCursor:
             self._sid = _snapshot_id(self._items)
             # Share the derived identity with the pin box so the in-use
             # check at reclamation never hashes this snapshot again.
-            self._box._sid = self._sid
+            box = self._box
+            if box is not None:
+                box.share_sid(self._sid)
         if self._publisher is not None:
             self._publisher(self._seq, self._sid, self._items)
         return _encode_token(self._seq, self._sid, self._lo, self._hi,
@@ -416,6 +427,14 @@ _EMPTY_SNAPSHOT_ID = hashlib.sha256(b"").digest()
 # many published snapshot copies are always retained; older copies are
 # reclaimed once nothing is using them.
 _SNAPSHOT_RETENTION = 3
+# Fixed-size read buffer for streaming copy verification: a copy is checked
+# against its content identity through this buffer, so verification and
+# reclamation never hold more of a copy in memory than this, however large
+# the snapshot is.
+_COPY_BUFFER = 1 << 16
+# A genuine snapshot header frame carries only its tiny metadata line; a
+# copy whose header claims a larger payload is damaged.
+_SNAP_HEADER_MAX = 1 << 20
 
 # Cross-process in-use registration. The in-process pin set only names users
 # in the opening process, so a snapshot pinned by a cursor or a read-only
@@ -441,20 +460,43 @@ _LEASE_REC_LEN = (len(_LEASE_REC_PREFIX) + _LEASE_SEQ_MAX + 1
                   + _LEASE_SID_HEX + 1 + _LEASE_TS_LEN + 1)
 
 
-def _snapshot_image(items) -> bytes:
-    """Canonical byte image of a committed snapshot: one put frame per key.
+def _put_frame_chunks(key: str, value: bytes):
+    """Yield the byte chunks of one canonical put frame, without copying.
 
-    ``items`` must already be sorted by the keys' raw UTF-8 bytes. The
-    image uses the same deterministic framing as the log, so it is
-    identical on every platform for the same snapshot.
+    The concatenation of the chunks is exactly ``_encode_frame(_OP_PUT,
+    value, key=key)``; hashing or writing them one at a time keeps the
+    memory peak independent of the value's size.
     """
-    return b"".join(_encode_frame(_OP_PUT, value, key=key)
-                    for key, value in items)
+    meta = json.dumps({"t": _OP_PUT, "k": key},
+                      separators=(",", ":"), ensure_ascii=False
+                      ).encode("utf-8")
+    prefix = _MAGIC + (len(meta) + 1 + len(value)).to_bytes(8, "big")
+    yield prefix
+    yield zlib.crc32(prefix).to_bytes(4, "big")
+    crc = zlib.crc32(meta)
+    crc = zlib.crc32(b"\n", crc)
+    crc = zlib.crc32(value, crc)
+    yield meta
+    yield b"\n"
+    yield value
+    yield crc.to_bytes(4, "big")
 
 
 def _snapshot_id(items) -> bytes:
-    """Content identity of a committed snapshot (32 raw bytes)."""
-    return hashlib.sha256(_snapshot_image(items)).digest()
+    """Content identity of a committed snapshot (32 raw bytes).
+
+    The identity is the SHA-256 of the snapshot's canonical byte image --
+    one put frame per key, ``items`` already sorted by the keys' raw UTF-8
+    bytes, in the same deterministic framing as the log, so it is identical
+    on every platform for the same snapshot. It is computed incrementally,
+    frame by frame and chunk by chunk, so deriving it never materialises
+    the whole image (or even one whole frame) alongside the items.
+    """
+    hasher = hashlib.sha256()
+    for key, value in items:
+        for chunk in _put_frame_chunks(key, value):
+            hasher.update(chunk)
+    return hasher.digest()
 
 
 def _encode_token(seq: int, sid: bytes, lo: bytes | None,
@@ -535,9 +577,23 @@ class _SnapshotBox:
         self._sid = sid
 
     def sid(self) -> bytes:
+        # The identity is hashed lazily, so a scan that neither mints a
+        # token nor registers a cross-process lease pays no hashing cost.
         if self._sid is None:
             self._sid = _snapshot_id(self.items)
         return self._sid
+
+    def share_sid(self, sid: bytes) -> None:
+        """Adopt an identity derived elsewhere for this same snapshot.
+
+        A cursor that computed the content identity for its own token or
+        lease hands it over through this method instead of writing the
+        box's private slot, so neither side reaches into the other's
+        internals. The identity of a given snapshot is unique, so a
+        ``None`` slot is simply filled and an existing one is kept.
+        """
+        if self._sid is None:
+            self._sid = sid
 
 
 # Process-wide set of snapshots currently in use. Every open cursor and
@@ -1297,6 +1353,11 @@ class Store:
         # pin table; writers do not pin (the current snapshot is retained by
         # the retention rule itself), so this stays ``None`` on a writer.
         self._pin_box = None
+        # Verdicts of snapshot-copy verification within a single cleanup
+        # pass (publish + reclaim): ``(seq, sid) -> bool``. ``None`` means
+        # no cleanup is in progress; the table is reset at the start and
+        # end of every pass so a verdict never survives into a later one.
+        self._copy_verdicts = None
         # Cross-process lease registry for this directory, shared by every
         # store on it in this process. A read-only store acquires a lease for
         # its open-time snapshot; cursors and resume sessions acquire theirs
@@ -1895,11 +1956,11 @@ class Store:
         self._corrupt = False
         # Make the recovered committed snapshot resumable by token even
         # before this session commits again (an old-version directory or a
-        # reopened store). Best-effort below the write path.
-        self._archive_current_snapshot()
-        # Finish any reclamation a previous commit/compaction (or its kill)
-        # left, converging the historical-copy set at every open.
-        self._reclaim_snapshots()
+        # reopened store), and finish any reclamation a previous
+        # commit/compaction (or its kill) left, converging the
+        # historical-copy set at every open. One cleanup pass: each copy is
+        # verified at most once.
+        self._cleanup_snapshots()
 
     def _converge_on_open(self) -> None:
         """Crash cleanup at open; leave a corrupt store inert for recover()."""
@@ -2198,6 +2259,22 @@ class Store:
         return os.path.join(
             self._dir, f"{_SNAPSHOT_PREFIX}{seq}.{sid.hex()}")
 
+    def _cleanup_snapshots(self) -> None:
+        """Run one publish + reclaim pass over the snapshot copies.
+
+        Within a single pass every copy is read from disk at most once:
+        the publish check and the sweep share one verdict table, so a copy
+        already verified (or freshly published) by one side is not read
+        again by the other. The table is dropped at the end of the pass, so
+        a later pass always re-verifies against the bytes actually on disk.
+        """
+        self._copy_verdicts = {}
+        try:
+            self._archive_current_snapshot()
+            self._reclaim_snapshots()
+        finally:
+            self._copy_verdicts = None
+
     def _publish_snapshot(self, seq: int, sid: bytes | None,
                           items) -> None:
         """Durably publish a pinned snapshot image for later token resumes.
@@ -2206,31 +2283,49 @@ class Store:
         canonical put frames -- is content-addressed as
         ``wal.s<seq>.<id>`` and atomically replaced, so republishing over a
         healthy copy is a no-op and a kill mid-publish leaves only a temp
-        file the next open reclaims. An existing file is first verified
-        against the content identity in its name: a damaged copy at the
-        content address is atomically *replaced* by the authoritative image
-        (never edited in place), keeping the publish and the replace
-        kill-safe at any point. Writer-only: read-only stores never publish
-        snapshot copies (their cross-process pin rides the lease sidecar
-        instead). The empty initial snapshot (sequence 0) needs no file: it
-        is the well-known empty content and always reconstructible.
+        file the next open reclaims. A copy already at the content address
+        is first verified against the identity in its name (streaming, with
+        a fixed-size buffer); a damaged copy at the content address is
+        atomically *replaced* by the authoritative image (never edited in
+        place), keeping the publish and the replace kill-safe at any point.
+        Writer-only: read-only stores never publish snapshot copies (their
+        cross-process pin rides the lease sidecar instead). The empty
+        initial snapshot (sequence 0) needs no file: it is the well-known
+        empty content and always reconstructible.
         """
         if seq == 0:
             return
         if sid is None:
             sid = _snapshot_id(items)
         path = self._snapshot_blob_path(seq, sid)
-        if os.path.exists(path):
-            if self._read_snapshot_blob(seq, sid, path) is not None:
-                return
-            # The file at the content address fails verification: fall
-            # through and replace it atomically with the correct image.
-        blob = _encode_frame(_OP_SNAP, seq=seq) + _snapshot_image(items)
-
+        key = (seq, sid)
+        verdicts = self._copy_verdicts
+        verdict = verdicts.get(key) if verdicts is not None else None
+        if verdict is None and os.path.exists(path):
+            # Verify the copy at the content address; the verdict is shared
+            # with this cleanup's sweep so no copy is read twice.
+            verdict = self._verify_snapshot_blob(seq, sid, path)
+            if verdicts is not None:
+                verdicts[key] = verdict
+        if verdict:
+            # A healthy copy already sits at the content address.
+            return
+        # Absent or damaged: (re)publish atomically. A damaged copy at the
+        # content address is replaced by the authoritative image, never
+        # edited in place; the image is streamed chunk by chunk, so the
+        # publish never materialises the whole blob (or one whole frame)
+        # alongside the items.
         def write(f):
-            f.write(blob)
+            f.write(_encode_frame(_OP_SNAP, seq=seq))
+            for key_, value in items:
+                for chunk in _put_frame_chunks(key_, value):
+                    f.write(chunk)
 
         self._atomic_file(path, write)
+        # The authoritative bytes are durable at the content address; the
+        # sweep reuses this verdict instead of re-reading the file.
+        if verdicts is not None:
+            verdicts[key] = True
 
     def _archive_current_snapshot(self) -> None:
         """Publish the current committed snapshot's sidecar if missing."""
@@ -2287,11 +2382,16 @@ class Store:
         ongoing reads and resumed scans do not change by a byte.
 
         Every copy is first verified against the content identity in its
-        name. A copy whose bytes do not hash to that identity is damaged:
+        name -- a single streaming read through a fixed-size buffer, so the
+        memory peak of the sweep does not grow with the size of a copy. A
+        copy whose bytes do not hash to that identity is damaged:
         it can serve no reader or resume (those rebuild the snapshot from
         the committed log prefix or the checkpoint instead), so it is
         reclaimed outright, whatever the retention window or the in-use set
-        says, and it does not count as a published generation.
+        says, and it does not count as a published generation. Verdicts are
+        shared with the publish step of the same cleanup pass, so each copy
+        is read at most once per pass and the directory is synced at most
+        once, regardless of how many copies exist.
 
         Before removing any single copy every lease is re-read, so a lease
         registered while the sweep runs still protects its copy; stale lease
@@ -2307,16 +2407,24 @@ class Store:
             names = os.listdir(self._dir)
         except FileNotFoundError:
             return
+        verdicts = self._copy_verdicts
+        if verdicts is None:
+            # Defensive: the sweep normally runs inside a cleanup pass.
+            verdicts = {}
         for name in names:
             parsed = self._parse_snapshot_name(name)
             if parsed is None:
                 continue
             seq, sid = parsed
-            path = os.path.join(self._dir, name)
-            if self._read_snapshot_blob(seq, sid, path) is None:
-                damaged.append((seq, sid, name))
-            else:
+            verdict = verdicts.get((seq, sid))
+            if verdict is None:
+                verdict = self._verify_snapshot_blob(
+                    seq, sid, os.path.join(self._dir, name))
+                verdicts[(seq, sid)] = verdict
+            if verdict:
                 copies.append((seq, sid, name))
+            else:
+                damaged.append((seq, sid, name))
         # Forget lease sidecars whose owner stopped heartbeating before
         # consulting the registry, so a killed process cannot pin a copy
         # past the TTL. Best-effort: a sweep that fails changes nothing.
@@ -2356,8 +2464,73 @@ class Store:
         if removed:
             _fsync_dir(self._dir)
 
+    def _verify_snapshot_blob(self, seq: int, sid: bytes,
+                              path: str | None = None) -> bool:
+        """Stream-verify a published snapshot copy against its name.
+
+        The copy is read exactly once through a fixed-size buffer: the
+        snapshot header frame is validated first, then every remaining byte
+        is fed to the running content hash, so the memory peak stays
+        bounded no matter how large the copy is. Returns ``True`` only when
+        the file is exactly the authoritative image -- the snapshot header
+        carrying ``seq`` followed by the canonical put frames whose hash is
+        ``sid``. Anything else (absent, torn, rewritten, mis-headed or
+        trailing garbage) is *damaged* and returns ``False``; a damaged
+        copy is never trusted as a source, never guessed at and never
+        repaired in place. Callers rebuild the snapshot from the committed
+        log prefix or the checkpoint instead, and the writer's reclamation
+        removes the file.
+        """
+        if path is None:
+            path = self._snapshot_blob_path(seq, sid)
+        try:
+            f = open(path, "rb")
+        except OSError:
+            # Absent or unreadable: not a usable copy either way.
+            return False
+        with f:
+            header = f.read(_HEADER)
+            if len(header) < _HEADER or header[:4] != _MAGIC:
+                return False
+            if int.from_bytes(header[_PREFIX:], "big") != zlib.crc32(
+                    header[:_PREFIX]):
+                return False
+            length = int.from_bytes(header[4:_PREFIX], "big")
+            if length > _SNAP_HEADER_MAX:
+                return False
+            payload = f.read(length)
+            trailer = f.read(_TRAILER)
+            if len(payload) < length or len(trailer) < _TRAILER:
+                return False
+            if int.from_bytes(trailer, "big") != zlib.crc32(payload):
+                return False
+            newline = payload.find(b"\n")
+            if newline < 0 or newline != len(payload) - 1:
+                return False
+            try:
+                meta = json.loads(payload[:newline])
+            except (ValueError, UnicodeDecodeError):
+                return False
+            if (not isinstance(meta, dict) or meta.get("t") != _OP_SNAP
+                    or meta.get("s") != seq):
+                return False
+            # Everything past the header frame is the canonical put-frame
+            # image; hash it in fixed-size chunks.
+            hasher = hashlib.sha256()
+            while True:
+                chunk = f.read(_COPY_BUFFER)
+                if not chunk:
+                    break
+                hasher.update(chunk)
+            return hasher.digest() == sid
+
     def _read_snapshot_blob(self, seq: int, sid: bytes, path: str | None = None):
         """Load and verify a published snapshot sidecar; ``None`` if unusable.
+
+        This is the resume path: the snapshot is materialised for the
+        cursor, so the file is read in full. Verification-only callers
+        (publish, reclaim) use :meth:`_verify_snapshot_blob`, which streams
+        the copy through a fixed-size buffer instead.
 
         The blob must be a clean frame sequence: one snapshot header with
         the token's sequence, then put frames with strictly increasing keys
@@ -2588,15 +2761,12 @@ class Store:
         # separate read-only process -- keeps resuming after later commits,
         # compaction and reclamation. Content-addressed and atomic, so a
         # repeated publish is a no-op and a kill leaves only a reclaimed
-        # temp file.
-        self._publish_snapshot(self._seq, None,
-                               self._sorted_snapshot_items(self._data))
+        # temp file. Then reclaim historical copies: only the current one,
+        # the newest three generations and copies currently in use survive.
+        # One cleanup pass, so each copy is verified at most once.
+        self._cleanup_snapshots()
         if had_marker:
             self._remove_marker()
-        # Reclaim historical copies now that the new committed snapshot is
-        # durably published: only the current one, the newest three
-        # generations and copies currently in use survive.
-        self._reclaim_snapshots()
         return self._seq
 
     def recover(self) -> dict:
@@ -2635,8 +2805,7 @@ class Store:
         self._corrupt = False
         # Converge the historical-copy set as an open does; the report is
         # unaffected because reclamation deletes only redundant copies.
-        self._archive_current_snapshot()
-        self._reclaim_snapshots()
+        self._cleanup_snapshots()
         return {"applied": applied, "discarded": discarded, "seq": seq}
 
     def compact(self) -> dict:
@@ -2685,8 +2854,7 @@ class Store:
         # The old log space is gone; make sure the surviving committed
         # snapshot is published as a copy, then run the same reclamation a
         # commit performs so dead historical copies do not accumulate here.
-        self._archive_current_snapshot()
-        self._reclaim_snapshots()
+        self._cleanup_snapshots()
 
         self._entries = 0 if seq == 0 else live + 1
         self._pending = 0
