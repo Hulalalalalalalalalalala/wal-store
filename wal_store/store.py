@@ -61,48 +61,64 @@ store, writer or read-only -- continues the identical range from the
 identical position over the identical snapshot, so the resumed stream is
 byte-for-byte the tail of the original scan. Tokens stay valid across
 later commits, compaction, crash recovery and reclamation of the old log
-space: a writer durably publishes the pinned snapshot as an immutable
-``wal.s<seq>.<id>`` sidecar when a token is minted, and snapshots that
-were never published still resolve from the committed log prefix or the
-checkpoint. Deleted keys -- including keys covered by range tombstones
-that compaction has since reclaimed -- never reappear: the resumed stream
-is always exactly the pinned snapshot. A token that is forged, truncated,
-corrupted, out of range or names a snapshot the store does not hold raises
-``ValueError`` with no guessing or repair; only genuine ``bytes`` are
-accepted (a ``bytearray`` or ``memoryview`` raises ``TypeError``), and the
-token bytes are platform-independent and identical for the same snapshot
-and position.
+space: a writer durably publishes the pinned snapshot under the immutable
+``wal.s<seq>.<id>`` replica name -- now a small block-reference manifest
+naming cross-generation, content-addressed ``wal.b<id>`` blocks rather
+than a second full image -- and snapshots that were never published still
+resolve from the committed log prefix or the checkpoint. Deleted keys --
+including keys covered by range tombstones that compaction has since
+reclaimed -- never reappear: the resumed stream is always exactly the
+pinned snapshot. A token that is forged, truncated, corrupted, out of
+range or names a snapshot the store does not hold raises ``ValueError``
+with no guessing or repair; only genuine ``bytes`` are accepted (a
+``bytearray`` or ``memoryview`` raises ``TypeError``), and the token
+bytes are platform-independent and identical for the same snapshot and
+position.
 
-Published snapshot copies have a lifecycle of their own, so the store
-directory does not grow one permanent copy per minted token. Reclamation
-runs after every commit and every compaction and is finished at every
-writer open. A copy survives while it is *in use* -- an open cursor, a
-live read-only store, or a resumed scan in this process or *any other
-process*, is serving that snapshot -- and the current committed snapshot
-together with the newest three published predecessor generations are
-always retained; every other copy is removed. The in-process pin set is
-process-wide and weak, so a writer and the read-only stores (or cursors)
-in the same process share one notion of "in use", and a cursor dropped
-without ``close()`` releases its pin when it is garbage collected.
+Published snapshots are stored chunked and content-addressed, so the
+directory does not grow one full image per generation. Each canonical
+put frame is one immutable ``wal.b<id>`` block named by the identity of
+its own bytes: an unchanged key/value pair is the same block in every
+generation and is stored once. The ``wal.s<seq>.<id>`` replica keeps its
+name and its content identity (the one the token carries) and is now a
+small manifest naming the ordered blocks of the image, atomically
+replaced and never edited in place; a legacy whole image under the same
+name stays readable and reclaimable with no conversion. Reclamation is a
+reference-safe two-phase convergence that runs after every commit and
+every compaction and is finished at every writer open. Phase one
+converges the manifest set: a manifest survives while it names the
+current committed snapshot, one of the newest three retained predecessor
+generations, or a snapshot that is *in use* -- an open cursor, a live
+read-only store, or a resumed scan in this process or *any other
+process*. Phase two deletes exactly the blocks no surviving manifest
+references. A block therefore disappears only outside the retention
+window and with no in-use snapshot or fresh lease pointing at it, and
+the total block count grows with distinct frame content rather than with
+generations. The in-process pin set is process-wide and weak, so a
+writer and the read-only stores (or cursors) in the same process share
+one notion of "in use", and a cursor dropped without ``close()``
+releases its pin when it is garbage collected.
 
-A copy's name carries its content identity, and every use of a copy
-verifies the file against it: when the store is opened, when a token is
-resumed and when the writer decides whether a copy is usable, the actual
-bytes on disk must hash to the identity in the name. Every verification
-is incremental -- a copy is checked through a fixed-size read buffer
-with the content identity computed as a running hash -- so verifying or
-reclaiming a copy never holds the whole copy in memory, and the memory
-peak does not grow with the copy's size, however large the snapshot. A
-copy whose content does not match its identity is damaged; it is never
-trusted as a source, never guessed at and never repaired in place, and
-it changes neither the committed state nor any read by a byte. Reads and
-resumed scans rebuild the snapshot from the committed log prefix or the
-checkpoint instead -- byte-for-byte the result a healthy copy would have
-served -- and the writer reclaims the damaged file in its ordinary sweep
-(publishing or replacing a copy stays atomic and kill-safe, so a kill at
-any point and a reopen converge to the same copy set). Only when the
-copy, the log prefix and the checkpoint can none of them rebuild the
-snapshot does an old token stop resolving (``ValueError``).
+A block or manifest whose bytes do not hash to the identity in its name
+is damaged; it is never trusted as a source, never guessed at and never
+repaired in place, and it changes neither the committed state nor any
+read by a byte. Every verification is incremental -- blocks stream
+through a fixed-size read buffer, the content identity is composed block
+by block, and each distinct block is read at most once per sweep -- so
+verification never holds a whole snapshot in memory, however large. Reads
+and resumed scans rebuild the snapshot from the committed log prefix or
+the checkpoint instead -- byte-for-byte the result a healthy replica
+would have served -- and the writer reclaims the damaged manifest in its
+ordinary sweep; a damaged block still referenced follows that
+reference's lifecycle (the next publish replaces it), and an
+unreferenced one is deleted in phase two. A damaged replica of the
+*current* snapshot is atomically replaced with the authoritative
+manifest the next time it is published. Publishing and replacing
+replicas stays atomic and kill-safe, so a kill at any point and a reopen
+converge to the same manifests, the same in-use blocks and the same file
+set. Only when every replica is gone or damaged and neither the log
+prefix nor the checkpoint can rebuild the snapshot does an old token
+stop resolving (``ValueError``).
 
 The in-process pin set cannot see users in other processes, so every
 read-only store -- and every cursor and resume session, on either open
@@ -110,31 +126,31 @@ form of the store -- additionally registers a short-lived *lease* (the
 one kind of sidecar a reader is allowed to write, named
 ``wal.lease.<pid>.<rand>``) listing the snapshots that
 process has in use with a heartbeat. The writer reads all lease sidecars
-before reclaiming a copy (re-reading them immediately before each unlink,
-so a lease taken mid-sweep still protects its copy) and keeps every copy a
-fresh lease names. An orderly close removes the sidecar; a process killed
-without closing simply stops heartbeating, and expiry is then detected
-two ways -- the heartbeat goes stale after the lease TTL, and a sidecar
-whose owning process no longer exists expires immediately -- after which
-the sidecar pins nothing and is swept. Each lease sidecar is atomically
-rewritten (temp file, rename) and only its owner ever writes it, so
-registering, expiring and reclaiming -- with a kill at any point, reopened
-in any process -- converge to the same in-use set and the same copy set.
-Lease writes are best-effort, so a genuinely read-only directory simply
-has no lease.
+before reclaiming a replica (re-reading them immediately before each
+unlink, so a lease taken mid-sweep still protects its replica) and keeps
+every replica a fresh lease names. An orderly close removes the
+sidecar; a process killed without closing simply stops heartbeating,
+and expiry is then detected two ways -- the heartbeat goes stale after
+the lease TTL, and a sidecar whose owning process no longer exists
+expires immediately -- after which the sidecar pins nothing and is
+swept. Each lease sidecar is atomically rewritten (temp file, rename)
+and only its owner ever writes it, so registering, expiring and
+reclaiming -- with a kill at any point, reopened in any process --
+converge to the same in-use set, the same block set and the same replica
+set. Lease writes are best-effort, so a genuinely read-only directory
+simply has no lease.
 
-Reclamation deletes only redundant copies, never the log, the checkpoint
-or a record, and changes neither the durable sequence nor the committed
-state; the sweep is a set of independent unlinks followed by a directory
-sync, so a kill at any point and a reopen converges to the same file set.
-One sweep reads each copy at most once -- the verification results a
-publish in the same operation already produced are shared with the sweep
-rather than re-read -- and syncs the directory a bounded number of times,
-neither count growing with the number of copies. Losing a copy does not
-invalidate its token while the snapshot can still be rebuilt from the log
-prefix or the checkpoint, and a damaged copy counts as no copy at all;
-only once no usable copy remains and neither durable source can rebuild
-it does an old token stop resolving (``ValueError``).
+Two-phase reclamation deletes only redundant manifests and blocks, never
+the log, the checkpoint or a record, and changes neither the durable
+sequence nor the committed state; each phase is a set of independent
+unlinks followed by one directory sync, so a kill at any point and a
+reopen converges to the same file set. One sweep fully reads each
+distinct block at most once and syncs the directory a bounded number of
+times, neither count growing with the number of replicas or blocks.
+Losing a replica does not invalidate its token while the snapshot can
+still be rebuilt from the log prefix or the checkpoint; only once no
+usable replica remains and neither durable source can rebuild it does an
+old token stop resolving (``ValueError``).
 
 
 Range deletes (``Store.delete_range(start, end)``, or ``delete(start,
@@ -408,20 +424,49 @@ _OP_RANGE = "r"
 _OP_COMMIT = "c"
 _OP_BASE = "b"
 _COMMIT_OPS = (_OP_COMMIT, _OP_BASE)
-_OP_SNAP = "s"  # header frame of a pinned-snapshot sidecar
+_OP_SNAP = "s"     # header frame of a legacy whole-image sidecar
+_OP_MANIFEST = "M"  # header frame of a chunked snapshot manifest
+_OP_BLOCKREF = "Q"  # manifest frame naming one content-addressed block
 
-# Pinned-snapshot sidecars (``wal.s<seq>.<id>``) and scan tokens. A token
-# is an opaque, platform-independent byte string: magic, the snapshot's
-# durable sequence, its 32-byte content identity, the optional range
-# endpoints, the next position and a checksum -- all integers big-endian,
-# so the same snapshot and position mint byte-identical tokens everywhere.
+# Snapshot copies are chunked and content-addressed:
+#
+# ``wal.b<id>``
+#     One immutable *block*: exactly one canonical snapshot put frame, named
+#     by the 32-byte sha256 identity of its own frame bytes. An unchanged
+#     key/value pair has the same frame in every generation, so it lands on
+#     disk exactly once and is shared by every replica list that contains
+#     it; the total number of blocks does not grow linearly with
+#     generations.
+#
+# ``wal.s<seq>.<id>``
+#     The replica list for the snapshot at sequence ``seq`` -- the same
+#     file name and content identity older builds used for the whole image.
+#     Its bytes are now a small framed *manifest*: a header (op ``M``)
+#     carrying the sequence and the snapshot's unchanged full-image content
+#     identity, followed by one reference frame (op ``Q``) per ordered
+#     content-addressed block whose concatenated put frames are that image.
+#     Published atomically (temp file, fsync, rename, directory fsync),
+#     never edited in place. The first frame's op distinguishes a manifest
+#     from a legacy whole-image copy (header op ``s``), which stays
+#     readable and reclaimable under its old rules with no conversion.
+#
+# A token is an opaque, platform-independent byte string: magic, the
+# snapshot's durable sequence, its 32-byte content identity, the optional
+# range endpoints, the next position and a checksum -- all integers
+# big-endian, so the same snapshot and position mint byte-identical tokens
+# everywhere.
 _TOKEN_MAGIC = b"WST1"
+_BLOCK_PREFIX = "wal.b"
 _SNAPSHOT_PREFIX = "wal.s"
+_ID_HEX_LEN = 64
 _EMPTY_SNAPSHOT_ID = hashlib.sha256(b"").digest()
 # Besides the snapshot the store is currently committed at, the newest this
-# many published snapshot copies are always retained; older copies are
-# reclaimed once nothing is using them.
+# many published snapshot generations (manifest or legacy copy) are always
+# retained; older publications are reclaimed once nothing is using them.
 _SNAPSHOT_RETENTION = 3
+# A manifest frame only ever carries compact JSON metadata; a payload past
+# this size is a damaged manifest rather than a frame to stream.
+_MANIFEST_MAX_PAYLOAD = 1 << 14
 
 # Cross-process in-use registration. The in-process pin set only names users
 # in the opening process, so a snapshot pinned by a cursor or a read-only
@@ -1098,6 +1143,15 @@ def _key_in_range(key_bytes: bytes, lo: bytes | None,
     return True
 
 
+def _frame_from_meta(meta: dict, value: bytes = b"") -> bytes:
+    """Encode one already-built metadata dict plus raw value as a frame."""
+    head = json.dumps(meta, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    payload = head + b"\n" + value
+    prefix = _MAGIC + len(payload).to_bytes(8, "big")
+    header = prefix + zlib.crc32(prefix).to_bytes(4, "big")
+    return header + payload + zlib.crc32(payload).to_bytes(4, "big")
+
+
 def _encode_frame(op: str, value: bytes = b"", key: str | None = None,
                   seq: int | None = None, start: str | None = None,
                   end: str | None = None) -> bytes:
@@ -1111,11 +1165,17 @@ def _encode_frame(op: str, value: bytes = b"", key: str | None = None,
             meta["k"] = key
         if seq is not None:
             meta["s"] = seq
-    head = json.dumps(meta, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    payload = head + b"\n" + value
-    prefix = _MAGIC + len(payload).to_bytes(8, "big")
-    header = prefix + zlib.crc32(prefix).to_bytes(4, "big")
-    return header + payload + zlib.crc32(payload).to_bytes(4, "big")
+    return _frame_from_meta(meta, value)
+
+
+def _manifest_header_frame(seq: int, sid: bytes) -> bytes:
+    """The manifest's first frame: sequence plus snapshot content identity."""
+    return _frame_from_meta({"t": _OP_MANIFEST, "s": seq, "i": sid.hex()})
+
+
+def _block_ref_frame(bid: bytes) -> bytes:
+    """One manifest frame naming a content-addressed block by its identity."""
+    return _frame_from_meta({"t": _OP_BLOCKREF, "b": bid.hex()})
 
 
 def _iter_frames(f):
@@ -1283,6 +1343,135 @@ def _verify_snapshot_blob(path: str, seq: int, sid: bytes) -> bool:
     return saw_head and digest.digest() == sid
 
 
+def _stream_one_frame(f, digest, retain_value=False,
+                      max_payload=_MAX_PAYLOAD):
+    """Consume one framed record from ``f`` through a fixed-size buffer.
+
+    The frame's exact bytes (header, payload and trailer) are fed to the
+    running ``digest`` when one is given; the payload checksum is verified on
+    a rolling crc. Only the compact metadata line is retained, plus the
+    value when ``retain_value`` asks for it, so a frame of any size is
+    verified with no more than one ``_SNAPSHOT_READ_CHUNK`` read resident.
+
+    Returns ``(meta, value, raw_length)`` for one intact frame, ``None`` at
+    clean EOF, or ``False`` for a torn/invalid frame.
+    """
+    header = f.read(_HEADER)
+    if not header:
+        return None
+    if len(header) < _HEADER or header[:4] != _MAGIC:
+        return False
+    if int.from_bytes(header[_PREFIX:], "big") != zlib.crc32(
+            header[:_PREFIX]):
+        return False
+    length = int.from_bytes(header[4:_PREFIX], "big")
+    if length > max_payload:
+        return False
+    sink = None
+    if digest is not None:
+        sink = digest if callable(digest) else digest.update
+    if sink is not None:
+        sink(header)
+    remaining = length
+    payload_crc = 0
+    chunks = []
+    head = b""
+    newline = -1
+    consumed = 0
+    while remaining:
+        chunk = f.read(min(remaining, _SNAPSHOT_READ_CHUNK))
+        if not chunk:
+            return False
+        if sink is not None:
+            sink(chunk)
+        payload_crc = zlib.crc32(chunk, payload_crc)
+        if retain_value:
+            chunks.append(chunk)
+        if newline < 0:
+            nl = chunk.find(b"\n")
+            if nl >= 0:
+                newline = consumed + nl
+                head += chunk[:nl]
+            else:
+                head += chunk
+        remaining -= len(chunk)
+        consumed += len(chunk)
+    trailer = f.read(_TRAILER)
+    if len(trailer) < _TRAILER:
+        return False
+    if sink is not None:
+        sink(trailer)
+    if int.from_bytes(trailer, "big") != payload_crc or newline < 0:
+        return False
+    try:
+        meta = json.loads(head)
+    except (ValueError, UnicodeDecodeError):
+        return False
+    value = None
+    if retain_value:
+        payload = b"".join(chunks)
+        # Only the bytes past the metadata newline are the value; the head
+        # is retained just long enough to parse the metadata.
+        value = payload[newline + 1:]
+    return meta, value, _HEADER + length + _TRAILER
+
+
+def _verify_named_block(path: str, bid: bytes, sink=None) -> bool:
+    """Stream-verify a ``wal.b<id>`` block against the identity in its name.
+
+    A block is exactly one canonical put frame whose exact bytes hash to
+    ``bid``; its payload checksum and metadata must check. When ``sink`` is
+    a second hash object it is fed the same frame bytes, so a caller can
+    compose the block into the snapshot's content identity in the same
+    single read. The value is never retained. Anything torn, rewritten,
+    mis-headed or unreadable is a damaged block and yields ``False``.
+    """
+    digest = hashlib.sha256()
+
+    def both(data):
+        digest.update(data)
+        if sink is not None:
+            sink.update(data)
+
+    try:
+        with open(path, "rb") as f:
+            result = _stream_one_frame(f, both)
+            if result is None or result is False:
+                return False
+            meta, _value, _length = result
+            extra = f.read(1)
+            if extra:
+                return False
+    except OSError:
+        return False
+    if not isinstance(meta, dict) or meta.get("t") != _OP_PUT:
+        return False
+    key = meta.get("k")
+    if not isinstance(key, str) or key == "":
+        return False
+    return digest.digest() == bid
+
+
+def _read_sidecar_op(path: str):
+    """The first frame's metadata of a ``wal.s*`` sidecar, or None/False.
+
+    Returns the parsed metadata dict of the first frame, ``False`` for a
+    torn/invalid first frame. This is how a chunk-reference manifest
+    (header op ``M``) is told apart from a legacy whole-image copy (header
+    op ``s``) when the two share the one ``wal.s<seq>.<id>`` name form.
+    """
+    try:
+        with open(path, "rb") as f:
+            result = _stream_one_frame(
+                f, None, max_payload=_MANIFEST_MAX_PAYLOAD)
+    except OSError:
+        return False
+    if result is None or result is False:
+        return False
+    meta, _value, _length = result
+    return meta if isinstance(meta, dict) else False
+
+
 def _fsync_dir(path: str) -> None:
     """Fsync a directory so a nearby rename/unlink is durable.
 
@@ -1440,6 +1629,12 @@ class Store:
         # Torn records dropped in this recovery epoch; wal.rec carries it
         # across processes until the next commit.
         self._discarded = 0
+        # Manifests one publish/recovery in this very call already verified
+        # fully (mapping the ``(seq, sid)`` key to its ordered block ids);
+        # the following reclaim sweep trusts them and their exclusively
+        # owned blocks instead of reading them a second time, then clears
+        # the table so the trust never spans operations.
+        self._verified_refs: dict = {}
 
         if read_only:
             # A read-only open holds no writable fd and never takes a lock;
@@ -1662,10 +1857,15 @@ class Store:
                 os.unlink(name)
             except FileNotFoundError:
                 pass
-        # Half-published snapshot sidecars left by a kill mid-token-mint.
+        # Half-published snapshot sidecars (replica lists and
+        # content-addressed blocks) left by a kill mid-publish. Only the
+        # single writer ever creates these, so a leftover temp can never be
+        # another process's in-flight publish and is removed at once; a
+        # referenced block is simply rewritten by the next publish and an
+        # unreferenced one is reclaimed anyway.
         for name in os.listdir(self._dir):
             if (name.startswith(_SNAPSHOT_PREFIX)
-                    and name.endswith(".tmp")):
+                    or name.startswith(_BLOCK_PREFIX)) and name.endswith(".tmp"):
                 try:
                     os.unlink(os.path.join(self._dir, name))
                 except OSError:
@@ -2021,12 +2221,12 @@ class Store:
         self._corrupt = False
         # Make the recovered committed snapshot resumable by token even
         # before this session commits again (an old-version directory or a
-        # reopened store). Best-effort below the write path. The copy it
-        # leaves verified is passed to the sweep so this open reads it once.
-        known_good = self._archive_current_snapshot()
+        # reopened store). Best-effort below the write path; the replica it
+        # just verified is shared with the sweep below via _verified_refs.
+        self._archive_current_snapshot()
         # Finish any reclamation a previous commit/compaction (or its kill)
-        # left, converging the historical-copy set at every open.
-        self._reclaim_snapshots(known_good)
+        # left, converging the replica and block sets at every open.
+        self._reclaim_snapshots()
 
     def _converge_on_open(self) -> None:
         """Crash cleanup at open; leave a corrupt store inert for recover()."""
@@ -2321,33 +2521,76 @@ class Store:
         """The durable-snapshot callback for cursors; ``None`` on readers."""
         return None if self._read_only else self._publish_snapshot
 
+    # -- chunked, content-addressed snapshot publication ------------------
+
+    def _block_path(self, bid: bytes) -> str:
+        return os.path.join(self._dir, f"{_BLOCK_PREFIX}{bid.hex()}")
+
     def _snapshot_blob_path(self, seq: int, sid: bytes) -> str:
+        """The replica-list name for a generation (also the legacy name)."""
         return os.path.join(
             self._dir, f"{_SNAPSHOT_PREFIX}{seq}.{sid.hex()}")
 
+    @staticmethod
+    def _manifest_bytes(seq: int, sid: bytes, refs) -> bytes:
+        """Canonical chunk-reference manifest: header frame then ref frames."""
+        out = [_manifest_header_frame(seq, sid)]
+        out.extend(_block_ref_frame(bid) for bid in refs)
+        return b"".join(out)
+
+    def _ensure_block(self, frame: bytes):
+        """Place one put frame at its content address if not already healthy.
+
+        Returns ``(bid, placed)``: the block identity and whether this call
+        staged a new block rename (a missing or damaged block replaced by
+        the authoritative frame). The block is named by the 32-byte
+        sha256 identity of the frame's own bytes, so an unchanged key/value
+        pair across generations is one file shared by every replica list.
+        An existing block is trusted only after a fixed-buffer stream
+        verification; a damaged block is replaced (never edited in place).
+        Block renames are synced once by the caller after the batch, so a
+        publish does a bounded number of directory syncs however many
+        blocks it places.
+        """
+        bid = hashlib.sha256(frame).digest()
+        path = self._block_path(bid)
+        if os.path.exists(path) and _verify_named_block(path, bid):
+            return bid, False
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(frame)
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        return bid, True
+
     def _publish_snapshot(self, seq: int, sid: bytes | None,
                           items):
-        """Durably publish a pinned snapshot image for later token resumes.
+        """Publish a pinned snapshot as a chunk-reference replica list.
 
-        The image -- a header frame carrying the sequence, then the
-        canonical put frames -- is content-addressed as
-        ``wal.s<seq>.<id>`` and atomically replaced, so republishing over a
-        healthy copy is a no-op and a kill mid-publish leaves only a temp
-        file the next open reclaims. An existing file is first verified
-        against the content identity in its name -- incrementally, through
-        a fixed-size read buffer: a damaged copy at the content address is
-        atomically *replaced* by the authoritative image (never edited in
-        place), keeping the publish and the replace kill-safe at any point.
-        Writer-only: read-only stores never publish snapshot copies (their
-        cross-process pin rides the lease sidecar instead). The empty
-        initial snapshot (sequence 0) needs no file: it is the well-known
-        empty content and always reconstructible.
+        Every canonical put frame is first placed as an immutable,
+        content-addressed ``wal.b<id>`` block (one disk copy of an
+        unchanged pair, shared by every generation containing it); the
+        replica list at the existing sidecar name
+        ``wal.s<seq>.<snapshot-id>`` is then rewritten from a whole-image
+        copy into a small manifest -- a header naming the sequence and the
+        unchanged snapshot content identity, followed by one reference
+        frame per ordered block -- and is published atomically last. The
+        name and the identity口径 are unchanged, so an old whole image and
+        an old token keep working verbatim; the two layouts are told apart
+        by the first frame's type.
+
+        A kill anywhere leaves either the old replica or the complete new
+        one: blocks are durable before the manifest rename, orphaned blocks
+        are swept once no manifest references them, and a half-written temp
+        is removed on the next open. A healthy existing publication --
+        chunked manifest or legacy whole image -- is a no-op; a damaged
+        file at the name is atomically replaced by the authoritative
+        manifest, never repaired in place.
 
         Returns the ``(seq, sid)`` key whenever this call leaves a
-        known-good copy on disk -- an existing copy that just verified, or
-        one this call wrote itself -- so a reclaim sweep in the same
-        cleanup can trust it without reading the file a second time.
-        Returns ``None`` for the empty initial snapshot, which has no file.
+        known-good publication, so the reclaim sweep in the same cleanup
+        trusts it without a second read. ``None`` for the empty initial
+        snapshot (sequence 0). Writer-only; readers never publish.
         """
         if seq == 0:
             return None
@@ -2355,38 +2598,96 @@ class Store:
             sid = _snapshot_id(items)
         path = self._snapshot_blob_path(seq, sid)
         if os.path.exists(path):
-            if _verify_snapshot_blob(path, seq, sid):
-                return (seq, sid)
-            # The file at the content address fails verification: fall
-            # through and replace it atomically with the correct image.
-        head = _encode_frame(_OP_SNAP, seq=seq)
-
-        def write(f):
-            # Stream the image frame by frame: the staged file gets exactly
-            # the canonical bytes without a second full copy in memory.
-            f.write(head)
-            for frame in _iter_snapshot_frames(items):
-                f.write(frame)
-
-        self._atomic_file(path, write)
+            first = _read_sidecar_op(path)
+            if first is not False and first is not None:
+                if first.get("t") == _OP_MANIFEST:
+                    refs = self._verify_manifest_at(path, seq, sid)
+                    if refs is not None:
+                        # This operation already streamed and verified every
+                        # one of these blocks; share that with the sweep that
+                        # follows in the same cleanup so a block whose only
+                        # user is this manifest is not read a second time.
+                        self._verified_refs[(seq, sid)] = tuple(refs)
+                        return (seq, sid)
+                elif first.get("t") == _OP_SNAP and first.get("s") == seq:
+                    # A healthy legacy whole image: leave it in place. It is
+                    # readable as before and follows the same reclaim rules;
+                    # nothing is rewritten just to convert it.
+                    if _verify_snapshot_blob(path, seq, sid):
+                        return (seq, sid)
+            # Damaged (or mis-headed): replace atomically below.
+        refs = []
+        wrote_block = False
+        for frame in _iter_snapshot_frames(items):
+            bid, placed = self._ensure_block(frame)
+            refs.append(bid)
+            wrote_block = wrote_block or placed
+        # One directory sync makes the whole block batch durable before the
+        # manifest that names them is published; the manifest rename then
+        # adds one more. A publish therefore syncs the directory a bounded
+        # number of times independent of how many blocks it shared in.
+        if wrote_block:
+            _fsync_dir(self._dir)
+        image = self._manifest_bytes(seq, sid, refs)
+        self._atomic_file(path, lambda f: f.write(image))
+        # The manifest was written by this call and every block it names was
+        # either written here or verified in ensure_block: share the result
+        # with the immediately following sweep.
+        self._verified_refs[(seq, sid)] = tuple(refs)
         return (seq, sid)
 
-    def _archive_current_snapshot(self):
-        """Publish the current committed snapshot's sidecar if missing.
+    def _verify_manifest_at(self, path: str, seq: int, sid: bytes):
+        """Full verification of one chunk manifest: ordered refs or None.
 
-        Returns the ``(seq, sid)`` key of the known-good copy, or ``None``
-        for the empty initial snapshot, which needs no file: it is always
-        reconstructible from its well-known content identity.
+        Each referenced block is streamed once, its bytes both checked
+        against the block's own content identity and composed, in the
+        manifest's order, into the snapshot identity the manifest
+        header/name require. Fixed buffer; only compact manifest metadata
+        is retained.
+        """
+        refs = self._manifest_refs_structural(path, seq, sid)
+        if refs is None:
+            return None
+        digest = hashlib.sha256()
+        for bid in refs:
+            if not _verify_named_block(self._block_path(bid), bid, digest):
+                return None
+        if digest.digest() != sid:
+            return None
+        return refs
+
+    def _archive_current_snapshot(self):
+        """Publish the current committed snapshot's replica list if missing.
+
+        Returns the ``(seq, sid)`` key of the known-good publication, or
+        ``None`` for the empty initial snapshot.
         """
         if self._seq == 0:
             return None
         return self._publish_snapshot(
             self._seq, None, self._sorted_snapshot_items(self._data))
 
-    # -- historical-copy reclamation --------------------------------------
+    # -- sidecar name parsing ---------------------------------------------
+
+    def _parse_block_name(self, name: str):
+        """Parse a ``wal.b<id>`` block name; the identity or ``None``."""
+        if not name.startswith(_BLOCK_PREFIX):
+            return None
+        stem = name[len(_BLOCK_PREFIX):]
+        try:
+            bid = bytes.fromhex(stem)
+        except ValueError:
+            return None
+        if len(bid) != 32:
+            return None
+        return bid
 
     def _parse_snapshot_name(self, name: str):
-        """Parse a ``wal.s<seq>.<id>`` sidecar name; ``None`` if not one."""
+        """Parse a ``wal.s<seq>.<id>`` replica-list name; else ``None``.
+
+        The name is shared by the new chunk-reference manifests and legacy
+        whole-image copies; the first frame's type distinguishes them.
+        """
         if not name.startswith(_SNAPSHOT_PREFIX):
             return None
         stem = name[len(_SNAPSHOT_PREFIX):]
@@ -2409,84 +2710,261 @@ class Store:
         readers in this process) and the fresh cross-process lease records
         (cursors, read-only stores and resume sessions in any other
         process). The lease files are re-read on every call, so a lease a
-        reader takes during a reclaim sweep is observed before the copy it
-        protects is removed.
+        reader takes during a reclaim sweep is observed before the replica
+        it protects is removed.
         """
         return _live_snapshot_keys() | self._leases.live_keys()
 
-    def _reclaim_snapshots(self, known_good=None) -> None:
-        """Reclaim published snapshot copies that are neither used nor kept.
+    # -- two-phase reference-safe reclamation -----------------------------
 
-        A copy is kept when it is the current committed snapshot, when it
-        belongs to the newest ``_SNAPSHOT_RETENTION`` generations with a
-        published copy, or when it is in use: an open cursor, a live
-        read-only store or a resume session in this process or in *any*
-        process. Cross-process users publish short-lived
-        ``wal.lease.*`` sidecars that are scanned here; a copy named by a
-        fresh, unexpired lease is never removed. Every other
-        ``wal.s<seq>.<id>`` sidecar is removed. Only redundant copies are
-        deleted -- the log prefix and the checkpoint are untouched -- so
-        ongoing reads and resumed scans do not change by a byte.
+    def _classify_sidecars(self):
+        """One directory pass over the ``wal.s<seq>.<id>`` replica lists.
 
-        Every copy is verified against the content identity in its name --
-        incrementally, streamed through a fixed-size read buffer, so the
-        memory peak of the sweep never grows with a copy's size. A copy
-        whose bytes do not hash to that identity is damaged: it can serve
-        no reader or resume (those rebuild the snapshot from the committed
-        log prefix or the checkpoint instead), so it is reclaimed outright,
-        whatever the retention window or the in-use set says, and it does
-        not count as a published generation. ``known_good`` is a
-        ``(seq, sid)`` key the same cleanup already verified or wrote (the
-        current snapshot's publish), so one cleanup reads every copy at
-        most once rather than re-reading what it just checked.
+        Returns ``(manifests, legacy, damaged)``:
 
-        Before removing any single copy every lease is re-read, so a lease
-        registered while the sweep runs still protects its copy; stale lease
-        sidecars (a process killed without closing, its heartbeat stopped)
-        are swept first. The scan is idempotent and kill-safe: each unlink
-        is independent, re-running reaches the same set of files, and a run
-        killed at any unlink is simply finished on the next open; malformed
-        sidecar names are ignored rather than treated as files to delete.
-        The directory is synced once at the end, never per copy.
+        * ``manifests`` -- ``[seq, sid, refs, name]`` for healthy
+          chunk-reference manifests (header op ``M``) whose referenced
+          blocks all verify and compose to the snapshot identity in the
+          name;
+        * ``legacy`` -- ``(seq, sid, name)`` for healthy legacy
+          whole-image copies (header op ``s``);
+        * ``damaged`` -- names whose bytes do not match their identity or
+          framing, whichever layout they pretend to.
+
+        Each distinct block that needs checking is fully read once for the
+        whole pass: the pass streams a shared block into every waiting
+        manifest hash in that single read while checking the block's own
+        content identity. A manifest the publish/recovery in this same call
+        already verified fully (``_verified_refs``) is trusted and its
+        exclusively owned blocks are not read again. Verification keeps
+        only compact manifest metadata, so memory stays bounded.
         """
-        copies = []    # (seq, sid, name) verified against their identity
-        damaged = []   # (seq, sid, name) failing verification
+        # Manifest records: [seq, sid, name, refs, digest, trusted].
+        records = []
+        legacy = []
+        damaged = []
         try:
             names = os.listdir(self._dir)
         except FileNotFoundError:
-            return
+            return [], [], []
         for name in names:
             parsed = self._parse_snapshot_name(name)
             if parsed is None:
                 continue
             seq, sid = parsed
-            if known_good is not None and (seq, sid) == known_good:
-                # Already verified (or atomically written) earlier in this
-                # same cleanup: counting it here merges what would be a
-                # second full read of the same copy into the first.
-                copies.append((seq, sid, name))
-                continue
             path = os.path.join(self._dir, name)
-            if _verify_snapshot_blob(path, seq, sid):
-                copies.append((seq, sid, name))
+            first = _read_sidecar_op(path)
+            if first is False or first is None:
+                damaged.append(name)
+                continue
+            op = first.get("t")
+            if op == _OP_MANIFEST:
+                # Structural check only here (framing/header/uniqueness);
+                # block content and image composition are verified once,
+                # globally, below.
+                refs = self._manifest_refs_structural(path, seq, sid)
+                if refs is None:
+                    damaged.append(name)
+                    continue
+                preverified = self._verified_refs.get((seq, sid))
+                trusted = (preverified is not None
+                           and tuple(preverified) == tuple(refs))
+                digest = None if trusted else hashlib.sha256()
+                records.append([seq, sid, name, list(refs), digest, trusted])
+            elif op == _OP_SNAP:
+                if _verify_snapshot_blob(path, seq, sid):
+                    legacy.append((seq, sid, name))
+                else:
+                    damaged.append(name)
             else:
-                damaged.append((seq, sid, name))
-        # Forget lease sidecars whose owner stopped heartbeating before
-        # consulting the registry, so a killed process cannot pin a copy
-        # past the TTL. Best-effort: a sweep that fails changes nothing.
+                damaged.append(name)
+
+        # Build one reading order over the blocks the non-trusted manifests
+        # need. Each manifest lists blocks in the same canonical key order,
+        # so the predecessor chains are mutually consistent and a
+        # deterministic topological merge feeds each manifest's hash in its
+        # own ref order while reading every distinct block at most once.
+        users: dict = {}
+        preds: dict = {}
+        for rec in records:
+            if rec[5]:
+                continue
+            prev = None
+            for bid in rec[3]:
+                users.setdefault(bid, []).append(rec)
+                preds.setdefault(bid, set())
+                if prev is not None:
+                    preds[bid].add(prev)
+                prev = bid
+        order = []
+        remaining = dict(preds)
+        while remaining:
+            ready = sorted((bid for bid, need in remaining.items()
+                            if not need), key=bytes)
+            if not ready:
+                # Two chains disagree about block order -- impossible for
+                # canonical manifests: every manifest is damaged.
+                return [], [], [rec[2] for rec in records]
+            done = set(ready)
+            order.extend(ready)
+            for bid in ready:
+                del remaining[bid]
+            for need in remaining.values():
+                need -= done
+
+        block_good: dict = {}
+        for bid in order:
+            recs = users[bid]
+            digests = [rec[4] for rec in recs]
+            own = hashlib.sha256()
+
+            def feed(data, own=own, digests=digests):
+                own.update(data)
+                for dg in digests:
+                    dg.update(data)
+
+            ok = False
+            try:
+                with open(self._block_path(bid), "rb") as f:
+                    result = _stream_one_frame(f, feed)
+                    if result is not None and result is not False:
+                        meta, _v, _l = result
+                        if (isinstance(meta, dict) and meta.get("t") == _OP_PUT
+                                and isinstance(meta.get("k"), str)
+                                and meta.get("k") != ""
+                                and not f.read(1)
+                                and own.digest() == bid):
+                            ok = True
+            except OSError:
+                ok = False
+            block_good[bid] = ok
+
+        manifests = []
+        for seq, sid, name, refs, digest, trusted in records:
+            if trusted:
+                # Verified fully by the publish in this same call.
+                manifests.append([seq, sid, refs, name])
+                continue
+            if not all(block_good.get(bid) for bid in refs):
+                damaged.append(name)
+                continue
+            if digest.digest() != sid:
+                damaged.append(name)
+                continue
+            manifests.append([seq, sid, refs, name])
+        return manifests, legacy, damaged
+
+    @staticmethod
+    def _manifest_refs_structural(path: str, seq: int, sid: bytes):
+        """Frame/header/uniqueness check of a manifest; ordered refs or None.
+
+        Does not open the blocks: the content identity of the named
+        snapshot is composed from the blocks in one global pass. This reads
+        only the small manifest itself, in a fixed-size buffer.
+        """
+        refs = []
+        saw_head = False
+        seen = set()
+        try:
+            with open(path, "rb") as f:
+                while True:
+                    result = _stream_one_frame(
+                        f, None, max_payload=_MANIFEST_MAX_PAYLOAD)
+                    if result is None:
+                        break
+                    if result is False:
+                        return None
+                    meta, _value, _length = result
+                    if not isinstance(meta, dict):
+                        return None
+                    op = meta.get("t")
+                    if not saw_head:
+                        ident = meta.get("i")
+                        if (op != _OP_MANIFEST or meta.get("s") != seq
+                                or not isinstance(ident, str)
+                                or len(ident) != _ID_HEX_LEN):
+                            return None
+                        try:
+                            if bytes.fromhex(ident) != sid:
+                                return None
+                        except ValueError:
+                            return None
+                        saw_head = True
+                        continue
+                    if op != _OP_BLOCKREF:
+                        return None
+                    name = meta.get("b")
+                    if not isinstance(name, str) or len(name) != _ID_HEX_LEN:
+                        return None
+                    try:
+                        bid = bytes.fromhex(name)
+                    except ValueError:
+                        return None
+                    if bid in seen:
+                        return None
+                    seen.add(bid)
+                    refs.append(bid)
+        except OSError:
+            return None
+        return refs if saw_head else None
+
+    def _reclaim_snapshots(self) -> None:
+        """Two-phase, reference-safe convergence of snapshot storage.
+
+        Phase one converges the *replica lists* (the manifests). A
+        manifest or legacy copy is kept when it names the current
+        committed snapshot, when it is one of the newest
+        ``_SNAPSHOT_RETENTION`` published predecessor generations, or when
+        the snapshot is in use -- an open cursor, a live read-only store
+        or a resumed session in this process or any other one (fresh
+        ``wal.lease.*`` sidecars, re-read immediately before each unlink).
+        Everything outside the window with no user, and every damaged
+        replica list, is unlinked.
+
+        Phase two converges the *blocks*. A block is deleted only when no
+        surviving manifest references it. Because the retained window and
+        every in-use snapshot kept their manifests in phase one, such a
+        block is by construction outside the window and referenced by no
+        in-use snapshot or fresh lease in any process. Shared blocks
+        therefore survive as long as even one surviving manifest names
+        them -- one disk copy of an unchanged pair across any number of
+        generations -- and the block count grows only with distinct frame
+        content.
+
+        Ordering is the safe one: every publish durably places blocks and
+        atomically renames the manifest before this sweep runs; blocks are
+        removed only after the manifest set has converged and been synced.
+        Each unlink is independent and each phase ends with one directory
+        sync, so a kill at any point reopens into the identical manifest
+        set, the identical in-use block set and the identical file set;
+        sequence numbers only advance. Each block is fully read at most
+        once in a sweep and directory syncs are bounded (two plus lease
+        pruning). Illegal file names are never parsed or deleted.
+        """
+        manifests, legacy, damaged = self._classify_sidecars()
+        # The publish-results sharing only ever bridges the publish in this
+        # same call to this sweep; drop it up front so the trust cannot leak
+        # into any later operation (the classify above already consumed it).
+        self._verified_refs.clear()
+
+        # Forget stale lease sidecars before consulting the in-use view, so a
+        # killed holder cannot keep a replica past the TTL.
         self._leases.prune()
-        # Retain the current committed snapshot and the three newest
-        # generations that precede it; older generations are reclaimed
-        # unless a user (in any process) has them open.
-        predecessors = sorted({seq for seq, _sid, _n in copies
-                               if seq != self._seq}, reverse=True)
+
+        predecessors = sorted(
+            {seq for seq, _sid, _r, _n in manifests if seq != self._seq},
+            reverse=True)
         kept_seqs = {self._seq, *predecessors[:_SNAPSHOT_RETENTION]}
+        legacy_preds = sorted(
+            {seq for seq, _sid, _n in legacy if seq != self._seq},
+            reverse=True)
+        kept_seqs |= set(legacy_preds[:_SNAPSHOT_RETENTION])
+
         removed = False
-        for _seq, _sid, name in damaged:
-            # A damaged copy is garbage whatever pins or leases name it: the
-            # file itself can never serve a read again, and removing it
-            # changes no in-memory snapshot by a byte. A failed unlink is
-            # simply retried by the next sweep.
+        # A damaged replica serves nobody; it is removed regardless of
+        # retention or lease state -- the live reader serves its pinned
+        # in-memory snapshot and resumes rebuild from log prefix/checkpoint.
+        for name in damaged:
             try:
                 os.unlink(os.path.join(self._dir, name))
             except FileNotFoundError:
@@ -2494,38 +2972,136 @@ class Store:
             except OSError:
                 continue
             removed = True
-        for seq, sid, name in copies:
+
+        referenced: set = set()
+        in_use = self._in_use_keys
+        for seq, sid, refs, name in manifests:
+            if seq == self._seq or seq in kept_seqs or (seq, sid) in in_use():
+                referenced.update(refs)
+                continue
+            try:
+                os.unlink(os.path.join(self._dir, name))
+            except FileNotFoundError:
+                referenced.update(refs)
+                continue
+            except OSError:
+                # Could not remove it this sweep: keep its blocks referenced
+                # so nothing is orphaned; the next sweep retries.
+                referenced.update(refs)
+                continue
+            removed = True
+
+        for seq, sid, name in legacy:
             if seq == self._seq or seq in kept_seqs:
                 continue
-            # Re-scan every cross-process lease immediately before this
-            # unlink: an unexpired lease -- including one acquired after the
-            # sweep began -- keeps the copy, however briefly the window.
-            if (seq, sid) in self._in_use_keys():
+            if (seq, sid) in in_use():
                 continue
             try:
                 os.unlink(os.path.join(self._dir, name))
             except FileNotFoundError:
                 continue
+            except OSError:
+                continue
             removed = True
+
+        # Phase one is durable before any block is removed.
         if removed:
             _fsync_dir(self._dir)
 
+        # Phase two: blocks no surviving manifest references. A damaged
+        # block still referenced is distrusted on read but left to the
+        # manifest reference's lifecycle (the next publish of that
+        # snapshot replaces it atomically); nothing repairs a block in
+        # place. One directory sync bounds the phase.
+        removed_block = False
+        try:
+            names = os.listdir(self._dir)
+        except FileNotFoundError:
+            return
+        for name in names:
+            bid = self._parse_block_name(name)
+            if bid is None or bid in referenced:
+                continue
+            try:
+                os.unlink(os.path.join(self._dir, name))
+            except FileNotFoundError:
+                continue
+            except OSError:
+                continue
+            removed_block = True
+        if removed_block:
+            _fsync_dir(self._dir)
+
+    # -- snapshot reads and token resolution ------------------------------
+
+    def _read_manifest_snapshot(self, seq: int, sid: bytes):
+        """Materialise a snapshot from a chunk-reference manifest; else None.
+
+        Opens the replica list at ``wal.s<seq>.<sid>``; when its first
+        frame is a manifest header, reads each referenced block, verifies
+        the block against its content-addressed name, composes the put
+        frames into the snapshot identity and enforces strictly increasing
+        keys. Every block streams through a fixed-size buffer and only the
+        requested item list is retained. A missing/damaged block, a
+        mismatch with the name's identity or any torn frame makes the
+        manifest unusable (``None``): never trusted, guessed at or
+        repaired; the caller rebuilds from the committed log prefix or the
+        checkpoint, byte-for-byte the same snapshot.
+        """
+        path = self._snapshot_blob_path(seq, sid)
+        first = _read_sidecar_op(path)
+        if first is False or first is None or first.get("t") != _OP_MANIFEST:
+            return None
+        refs = self._manifest_refs_structural(path, seq, sid)
+        if refs is None:
+            return None
+        items = []
+        last_key = None
+        digest = hashlib.sha256()
+        for bid in refs:
+            block_digest = hashlib.sha256()
+
+            def feed(data):
+                block_digest.update(data)
+                digest.update(data)
+
+            try:
+                with open(self._block_path(bid), "rb") as f:
+                    result = _stream_one_frame(f, feed, retain_value=True)
+                    if result is None or result is False:
+                        return None
+                    meta, value, _length = result
+                    if f.read(1):
+                        return None
+            except OSError:
+                return None
+            if block_digest.digest() != bid:
+                return None
+            key = meta.get("k")
+            if (not isinstance(meta, dict) or meta.get("t") != _OP_PUT
+                    or not isinstance(key, str) or key == ""):
+                return None
+            if last_key is not None and key <= last_key:
+                return None
+            items.append((key, value))
+            last_key = key
+        if digest.digest() != sid:
+            return None
+        return items
+
     def _read_snapshot_blob(self, seq: int, sid: bytes, path: str | None = None):
-        """Load and verify a published snapshot sidecar; ``None`` if unusable.
+        """Load and verify a legacy whole-image sidecar; ``None`` if unusable.
 
         The blob must be a clean frame sequence: one snapshot header with
         the token's sequence, then put frames with strictly increasing keys
         whose canonical image hashes to the content identity in the name.
-        The file is scanned frame by frame -- never read whole -- and the
-        identity is recomputed as a running hash over the put frames as they
-        are verified, so the only snapshot-sized structure held is the item
-        list the caller itself asked for. A copy whose actual content does
-        not match that identity -- torn, rewritten, mis-headed, unsorted or
-        simply absent -- is *damaged*: it is never trusted as a source,
-        never guessed at and never repaired in place, so this returns
-        ``None`` exactly as if no copy existed. Callers rebuild the snapshot
-        from the committed log prefix or the checkpoint instead, and the
-        writer's reclamation removes the file.
+        The identity is recomputed as a running hash over the put frames,
+        so the only snapshot-sized structure held is the item list the
+        caller asked for. A copy whose content does not match its identity
+        -- torn, rewritten, mis-headed, unsorted or simply absent -- is
+        damaged: never trusted, never guessed at and never repaired in
+        place; the caller rebuilds from the log prefix or checkpoint and
+        the sweep reclaims the file.
         """
         if path is None:
             path = self._snapshot_blob_path(seq, sid)
@@ -2537,7 +3113,6 @@ class Store:
                 head_meta = None
                 for event in _iter_frames(f):
                     if event[0] != "frame":
-                        # A torn or invalid frame anywhere: damaged copy.
                         return None
                     _, meta, value, _start, _end = event
                     if head_meta is None:
@@ -2555,7 +3130,6 @@ class Store:
                     items.append((key, value))
                     last_key = key
         except OSError:
-            # Absent or unreadable: not a usable source either way.
             return None
         if head_meta is None:
             return None
@@ -2568,10 +3142,9 @@ class Store:
 
         Replays only the committed prefix ending at the commit (or base)
         marker carrying ``seq`` -- never uncommitted bytes, never anything
-        past the pinned point -- from ``wal.log`` or ``wal.ckp``, streamed
-        frame by frame rather than read whole. Returns the sorted items when
-        the reconstructed snapshot's identity matches ``sid``, else
-        ``None``.
+        past the pinned point -- from ``wal.log`` or ``wal.ckp``, frame by
+        frame. Returns the sorted items when the reconstructed snapshot's
+        identity matches ``sid``, else ``None``.
         """
         if seq < 1:
             return None
@@ -2581,7 +3154,6 @@ class Store:
                     state: dict[str, bytes] = {}
                     for event in _iter_frames(f):
                         if event[0] != "frame":
-                            # Torn or invalid tail: nothing usable past here.
                             break
                         _, meta, value, _start, _end = event
                         op = meta.get("t")
@@ -2625,15 +3197,15 @@ class Store:
         """Find the pinned snapshot a token names, or raise ``ValueError``.
 
         Resolution order: the process-wide registry of live snapshots, this
-        store's own committed state, the durable ``wal.s`` sidecar a writer
-        published when the token was minted, and the committed prefix of
-        the log or checkpoint. A sidecar whose content fails verification
-        against the identity in its name is damaged and simply does not
-        resolve here -- the rebuild from the committed log prefix or the
-        checkpoint serves the resume instead, byte-for-byte identical to
-        what a healthy copy would have served. The empty initial snapshot
-        (sequence 0) is always reconstructible. Anything else is a forged,
-        stale or foreign token and is rejected without guessing.
+        store's own committed state, the chunk-reference manifest at the
+        token's replica name, a legacy whole-image copy, and the committed
+        prefix of the log or checkpoint. Reads and resumed scans always
+        rebuild from the durable prefix/checkpoint when no clean replica
+        reaches the snapshot -- byte-for-byte identical to a normal
+        resume. A replica whose content fails its name's identity is
+        damaged and does not resolve here, never guessed at or repaired.
+        The empty initial snapshot (sequence 0) is always reconstructible.
+        Anything else is a forged, stale or foreign token and is rejected.
         """
         items = _pinned_snapshot(seq, sid)
         if items is not None:
@@ -2645,6 +3217,9 @@ class Store:
             items = self._sorted_snapshot_items(data)
             if _snapshot_id(items) == sid:
                 return items
+        items = self._read_manifest_snapshot(seq, sid)
+        if items is not None:
+            return items
         items = self._read_snapshot_blob(seq, sid)
         if items is not None:
             return items
@@ -2669,11 +3244,12 @@ class Store:
         if not lo_idx <= pos <= hi_idx:
             raise ValueError("scan token position is out of range")
         # A resume session leases the token's (possibly older) pinned
-        # snapshot on either open form, so a writer in another process
-        # keeps its copy; the in-process pin protects it in this one.
+        # snapshot on either open form, so a writer in another process keeps
+        # its files; the in-process pin protects it in this one.
         return ScanCursor(items, lo_idx, hi_idx, pos=pos, seq=seq, lo=lo,
                           hi=hi, publisher=self._snapshot_publisher(),
                           sid=sid, leases=self._leases)
+
 
     def delete(self, key: str | None, end: str | None = None) -> None:
         """Delete one key, or a half-open byte range when ``end`` is given.
@@ -2760,15 +3336,14 @@ class Store:
         # compaction and reclamation. Content-addressed and atomic, so a
         # repeated publish is a no-op and a kill leaves only a reclaimed
         # temp file.
-        known_good = self._publish_snapshot(
+        self._publish_snapshot(
             self._seq, None, self._sorted_snapshot_items(self._data))
         if had_marker:
             self._remove_marker()
-        # Reclaim historical copies now that the new committed snapshot is
-        # durably published: only the current one, the newest three
-        # generations and copies currently in use survive. The copy just
-        # published is already verified, so the sweep does not read it again.
-        self._reclaim_snapshots(known_good)
+        # Reclaim historical replicas and blocks now that the new committed
+        # snapshot is durably published: only the current generation, the
+        # newest three predecessors and snapshots currently in use survive.
+        self._reclaim_snapshots()
         return self._seq
 
     def recover(self) -> dict:
@@ -2807,8 +3382,8 @@ class Store:
         self._corrupt = False
         # Converge the historical-copy set as an open does; the report is
         # unaffected because reclamation deletes only redundant copies.
-        known_good = self._archive_current_snapshot()
-        self._reclaim_snapshots(known_good)
+        self._archive_current_snapshot()
+        self._reclaim_snapshots()
         return {"applied": applied, "discarded": discarded, "seq": seq}
 
     def compact(self) -> dict:
@@ -2857,8 +3432,8 @@ class Store:
         # The old log space is gone; make sure the surviving committed
         # snapshot is published as a copy, then run the same reclamation a
         # commit performs so dead historical copies do not accumulate here.
-        known_good = self._archive_current_snapshot()
-        self._reclaim_snapshots(known_good)
+        self._archive_current_snapshot()
+        self._reclaim_snapshots()
 
         self._entries = 0 if seq == 0 else live + 1
         self._pending = 0
