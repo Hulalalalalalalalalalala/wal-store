@@ -323,9 +323,10 @@ class ReadOnlyScanTest(ScanBase):
                 os.unlink(os.path.join(self.dir, name))
             except FileNotFoundError:
                 pass
-        # Pinned-snapshot sidecars are new too; an old directory has none.
+        # Pinned-snapshot sidecars and their content-addressed blocks are new
+        # too; an old directory has none of either.
         for name in os.listdir(self.dir):
-            if name.startswith("wal.s"):
+            if name.startswith("wal.s") or name.startswith("wal.b"):
                 os.unlink(os.path.join(self.dir, name))
         self.assertEqual(set(os.listdir(self.dir)), {"wal.log"})
         with self.reader() as r:
